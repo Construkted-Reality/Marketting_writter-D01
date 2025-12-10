@@ -11,9 +11,11 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
@@ -218,6 +220,33 @@ def build_user_prompt(topic_file: str) -> str:
         The user prompt string
     """
     return read_reference_file(topic_file)
+
+def create_output_directory(base_name: str) -> Path:
+    """Create organized output directory structure."""
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    output_dir = Path(f"outputs/{date_str}/{base_name}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create subdirectories
+    (output_dir / "candidates").mkdir(exist_ok=True)
+    
+    return output_dir
+
+def cleanup_old_outputs(days_to_keep: int = 30) -> None:
+    """Remove output directories older than specified days."""
+    cutoff_date = datetime.now() - timedelta(days=days_to_keep)
+    outputs_dir = Path("outputs")
+    
+    if outputs_dir.exists():
+        for output_dir in outputs_dir.iterdir():
+            if output_dir.is_dir():
+                # Check directory modification time
+                if datetime.fromtimestamp(output_dir.stat().st_mtime) < cutoff_date:
+                    print(f"Found old output directory: {output_dir}")
+                    response = input(f"Remove old output directory: {output_dir}? (y/N): ")
+                    if response.lower() == 'y':
+                        shutil.rmtree(output_dir)
+                        print(f"Removed: {output_dir}")
 
 def send_to_llm(
     user_prompt: str,
@@ -885,6 +914,9 @@ Write the complete article now. Start directly with the headline."""
         verbose=verbose
     )
     
+    # Filter out think tags from reasoning model output
+    article = filter_think_tags(article)
+    
     if verbose:
         word_count = len(article.split())
         print(f"✓ Synthesized article generated ({word_count} words)\n")
@@ -1180,7 +1212,7 @@ def save_pipeline_artifacts(
     verbose: bool = False
 ):
     """
-    Save all pipeline artifacts to disk.
+    Save all pipeline artifacts to organized directory structure.
     
     Args:
         result: Pipeline result dictionary
@@ -1188,15 +1220,16 @@ def save_pipeline_artifacts(
         verbose: Enable progress logging
     """
     timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_dir = create_output_directory(output_base)
     
     # Save final synthesized article
-    final_path = Path(f"{output_base}_FINAL.md")
+    final_path = output_dir / f"{output_base}_FINAL.md"
     final_path.write_text(result['final_article'], encoding='utf-8')
     if verbose:
         print(f"✓ Final article saved: {final_path}")
     
     # Save validation report
-    validation_path = Path(f"{output_base}_validation.json")
+    validation_path = output_dir / f"{output_base}_validation.json"
     validation_path.write_text(
         json.dumps(result['validation'].__dict__, indent=2),
         encoding='utf-8'
@@ -1205,7 +1238,7 @@ def save_pipeline_artifacts(
         print(f"✓ Validation report saved: {validation_path}")
     
     # Save all artifacts (cards, scores, blueprint)
-    artifacts_path = Path(f"{output_base}_pipeline_artifacts.json")
+    artifacts_path = output_dir / f"{output_base}_pipeline_artifacts.json"
     
     # Convert dataclass objects to dicts for JSON serialization
     serializable_artifacts = {
@@ -1306,6 +1339,12 @@ def main():
         default=1500,
         help="Target word count for synthesized article (default: 1500)"
     )
+    parser.add_argument(
+        "--cleanup-old",
+        type=int,
+        default=0,
+        help="Remove output directories older than N days (0 = disabled)"
+    )
     
     args = parser.parse_args()
     
@@ -1313,6 +1352,13 @@ def main():
     if args.enable_synthesis and args.iterations < 10:
         print("Warning: Synthesis pipeline recommended with --iterations >= 10")
         print("Proceeding anyway...")
+    
+    # Handle cleanup if requested
+    if args.cleanup_old > 0:
+        if args.verbose:
+            print(f"Cleaning up output directories older than {args.cleanup_old} days...")
+        cleanup_old_outputs(args.cleanup_old)
+        return 0
     
     try:
         # Load environment variables
@@ -1368,14 +1414,16 @@ def main():
             )
             candidates.append(candidate)
             
-            # Save individual candidate files
+            # Save individual candidate files to organized structure
             if args.output:
-                if args.iterations == 1:
-                    filename = f"{args.output}.md"
-                else:
-                    filename = f"{args.output}_candidate_{iteration:02d}.md"
+                output_dir = create_output_directory(args.output)
                 
-                Path(filename).write_text(
+                if args.iterations == 1:
+                    filename = output_dir / f"{args.output}.md"
+                else:
+                    filename = output_dir / "candidates" / f"{args.output}_candidate_{iteration:02d}.md"
+                
+                filename.write_text(
                     response + f"\n\n---\n**Word Count: {candidate.word_count}**",
                     encoding='utf-8'
                 )
