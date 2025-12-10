@@ -1,0 +1,5 @@
+Given the company context and the market research in the GIS space for small business, please write a marketing blog post article about our new collaboration features that allow multiple users to work together on 3D mapping projects.
+
+Discuss how these features enable real-time collaboration, improve team productivity, and foster innovation in the geospatial community. Highlight the benefits of community-driven development and how user feedback shapes our product roadmap.
+
+Talk about the advantages of building tools that prioritize user collaboration over corporate control, and how this approach leads to more innovative and user-friendly solutions in the mapping industry.
