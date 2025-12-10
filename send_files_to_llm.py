@@ -200,7 +200,7 @@ def send_to_llm(
 def main():
     """Main function to handle command line arguments and execute the script."""
     parser = argparse.ArgumentParser(
-        description="Generate marketing blog posts using a local OpenAI compliant API endpoint."
+        description="Generate marketing blog posts using a local OpenAI compliant API endpoint. Can run multiple iterations with numbered output files."
     )
     parser.add_argument(
         "--temperature",
@@ -211,12 +211,18 @@ def main():
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=4000,
+        default=40000,
         help="Maximum tokens to generate (default: 4000)"
     )
     parser.add_argument(
         "--output",
-        help="Optional file path to save the LLM response"
+        help="Base filename (without extension) to save LLM responses. Will create numbered markdown files when using multiple iterations."
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=1,
+        help="Number of times to run the LLM generation routine (default: 1). Creates numbered output files when > 1."
     )
     parser.add_argument(
         "--verbose",
@@ -261,39 +267,54 @@ def main():
         if args.verbose:
             print("Built system and user prompts from reference context files")
         
-        # Send to LLM
-        if args.verbose:
-            print("Sending request to LLM...")
-        
-        response = send_to_llm(
-            user_prompt=user_prompt,
-            system_prompt=system_prompt,
-            temperature=args.temperature,
-            max_tokens=args.max_tokens,
-            retry_count=args.retry_count,
-            retry_delay=args.retry_delay,
-            verbose=args.verbose
-        )
-        
-        # Apply think tag filtering if requested
-        if args.filter_think:
+        # Run LLM generation for specified number of iterations
+        for iteration in range(1, args.iterations + 1):
+            if args.verbose and args.iterations > 1:
+                print(f"\nRunning iteration {iteration} of {args.iterations}...")
+            
+            # Send to LLM
             if args.verbose:
-                print("Filtering out content between <think> tags...")
-            response = filter_think_tags(response)
-        
-        # Output the response
-        print("=" * 80)
-        print("LLM RESPONSE:")
-        print("=" * 80)
-        print(response)
-        print("=" * 80)
-        
-        # Save to file if requested
-        if args.output:
-            output_path = Path(args.output)
-            output_path.write_text(response, encoding="utf-8")
-            if args.verbose:
-                print(f"Response saved to: {output_path}")
+                print("Sending request to LLM...")
+            
+            response = send_to_llm(
+                user_prompt=user_prompt,
+                system_prompt=system_prompt,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
+                retry_count=args.retry_count,
+                retry_delay=args.retry_delay,
+                verbose=args.verbose
+            )
+            
+            # Apply think tag filtering if requested
+            if args.filter_think:
+                if args.verbose:
+                    print("Filtering out content between <think> tags...")
+                response = filter_think_tags(response)
+            
+            # Output the response
+            print("=" * 80)
+            if args.iterations > 1:
+                print(f"LLM RESPONSE (Iteration {iteration}):")
+            else:
+                print("LLM RESPONSE:")
+            print("=" * 80)
+            print(response)
+            print("=" * 80)
+            
+            # Save to file if requested
+            if args.output:
+                if args.iterations == 1:
+                    # Single iteration - use base filename
+                    output_filename = f"{args.output}.md"
+                else:
+                    # Multiple iterations - use numbered filename
+                    output_filename = f"{args.output}-{iteration:02d}.md"
+                
+                output_path = Path(output_filename)
+                output_path.write_text(response, encoding="utf-8")
+                if args.verbose:
+                    print(f"Response saved to: {output_path}")
         
         return 0
         
