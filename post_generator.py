@@ -326,7 +326,7 @@ def send_to_llm(
 
 
 # ============================================================================
-# PIPELINE STAGE 1: EXTRACT
+# PIPELINE STAGE 2: EXTRACT
 # Purpose: Convert full articles into structured article cards
 # ============================================================================
 
@@ -348,50 +348,7 @@ def extract_article_card(
     Returns:
         ArticleCard with structured data
     """
-    system_prompt = """You are a content analysis agent. Your job is to extract the essential elements from a marketing blog article into a structured format.
-
-You must respond with ONLY a valid JSON object. No markdown, no explanation, no preamble.
-
-## Output Schema
-
-{
-  "article_id": <integer>,
-  "headline_candidates": [
-    "<headline 1 from article>",
-    "<headline 2 - alternative or subheading that could work as main>"
-  ],
-  "opening_hook": "<The first 2-3 sentences verbatim. This is the hook that draws readers in.>",
-  "core_argument": "<A 2-3 sentence summary of the article's central thesis or value proposition. What is this article really saying?>",
-  "key_points": [
-    "<Key supporting point 1>",
-    "<Key supporting point 2>",
-    "<Key supporting point 3>",
-    "<Key supporting point 4 if present>",
-    "<Key supporting point 5 if present>"
-  ],
-  "memorable_phrases": [
-    "<Verbatim quote of a particularly well-written phrase or sentence>",
-    "<Another strong phrase worth preserving>",
-    "<Up to 5 total>"
-  ],
-  "structural_approach": "<Brief description: How is this article organized? (e.g., 'Problem-Solution-CTA', 'Listicle with intro/outro', 'Story-driven with embedded lessons', 'Question-answer format')>",
-  "evidence_used": [
-    "<Type of evidence: statistic, case study, expert quote, analogy, etc.>"
-  ],
-  "tone": "<1-3 words describing the tone: e.g., 'conversational and urgent', 'professional and authoritative', 'playful and accessible'>",
-  "target_audience_signals": "<Who does this article seem written for? What assumptions does it make about the reader?>",
-  "weaknesses": [
-    "<Identified weakness 1: e.g., 'Opening is generic', 'Lacks concrete examples', 'Too long before getting to the point'>",
-    "<Identified weakness 2 if present>"
-  ],
-  "word_count_estimate": <integer>
-}
-
-## Rules
-- Extract what IS there, don't invent or improve
-- For "memorable_phrases", copy VERBATIM - these are candidates for preservation
-- Be specific in weaknesses - vague criticism isn't useful
-- If the article lacks something (e.g., no statistics), note it in weaknesses"""
+    system_prompt = read_reference_file("prompts/pipeline_stage1_extract_system.md")
 
     user_prompt = f"""Extract the article card for Article #{article_id}.
 
@@ -462,7 +419,7 @@ def extract_all_article_cards(
     """
     if verbose:
         print(f"\n{'='*80}")
-        print("PIPELINE STAGE 1: EXTRACT")
+        print("PIPELINE STAGE 2: EXTRACT")
         print(f"{'='*80}")
         print(f"Extracting structured cards from {len(candidates)} articles...")
     
@@ -487,7 +444,7 @@ def extract_all_article_cards(
 
 
 # ============================================================================
-# PIPELINE STAGE 2: SCORE
+# PIPELINE STAGE 3: SCORE
 # Purpose: Evaluate article cards on quality dimensions with voting
 # ============================================================================
 
@@ -507,38 +464,7 @@ def score_article_card(
     Returns:
         ArticleScore with scores and justifications
     """
-    system_prompt = """You are a content quality evaluator. You will receive an article card (a structured summary of a blog article) and a set of scoring criteria.
-
-Score the article on each criterion from 1-10, and provide a brief justification for each score.
-
-You must respond with ONLY a valid JSON object. No markdown, no explanation.
-
-## Scoring Guidelines
-
-- 1-3: Poor. Significant problems or missing entirely.
-- 4-5: Below average. Present but weak.
-- 6-7: Acceptable. Meets basic expectations.
-- 8-9: Strong. Notably good, few improvements needed.
-- 10: Exceptional. Could be used as an example of excellence.
-
-Be discriminating. If everything scores 7-8, you're not being critical enough.
-Reserve 9-10 for genuinely standout elements.
-
-## Output Schema
-
-{
-  "article_id": <integer>,
-  "scores": {
-    "<criterion_name>": {
-      "score": <integer 1-10>,
-      "justification": "<1-2 sentences explaining the score>"
-    },
-    ...
-  },
-  "overall_score": <float - weighted average>,
-  "standout_strengths": ["<what this article does notably well>"],
-  "critical_weaknesses": ["<what would need fixing>"]
-}"""
+    system_prompt = read_reference_file("prompts/pipeline_stage2_score_system.md")
 
     user_prompt = f"""Score the following article card against the provided criteria.
 
@@ -640,7 +566,7 @@ def score_all_cards_with_voting(
     """
     if verbose:
         print(f"\n{'='*80}")
-        print("PIPELINE STAGE 2: SCORE")
+        print("PIPELINE STAGE 3: SCORE")
         print(f"{'='*80}")
         print(f"Scoring {len(cards)} cards with {votes} votes each...")
     
@@ -677,7 +603,7 @@ def score_all_cards_with_voting(
 
 
 # ============================================================================
-# PIPELINE STAGE 3: SELECT
+# PIPELINE STAGE 4: SELECT
 # Purpose: Analyze scores and select best elements for synthesis
 # ============================================================================
 
@@ -699,7 +625,7 @@ def select_best_elements(
     """
     if verbose:
         print(f"\n{'='*80}")
-        print("PIPELINE STAGE 3: SELECT")
+        print("PIPELINE STAGE 4: SELECT")
         print(f"{'='*80}")
         print(f"Analyzing {len(cards)} articles to select best elements...")
     
@@ -718,81 +644,7 @@ def select_best_elements(
             "overall_score": score.overall_score
         })
     
-    system_prompt = """You are a content strategy agent. You will receive summaries and scores for multiple article drafts on the same topic.
-
-Your job is to analyze them and create a "synthesis blueprint" - a specification for combining the best elements into one superior article.
-
-You must respond with ONLY a valid JSON object.
-
-## Your Task
-
-1. Identify which article has the best version of each element
-2. Note when elements should be combined from multiple sources
-3. Create a clear specification the synthesis agent can follow
-
-## Selection Principles
-
-- Don't just pick the highest-scoring article. Recombine strengths.
-- A 6-scoring article might have ONE element that's a 10.
-- Look for complementary strengths (Article A's hook + Article B's structure + Article C's evidence)
-- Note potential conflicts (if combining arguments that might contradict)
-
-## Output Schema
-
-{
-  "synthesis_blueprint": {
-    "selected_headline": {
-      "source_article": <article_id>,
-      "headline": "<the selected headline>",
-      "rationale": "<why this headline wins>"
-    },
-    "selected_opening": {
-      "source_article": <article_id>,
-      "approach": "<description of the opening approach to use>",
-      "key_elements": ["<specific elements to preserve>"],
-      "rationale": "<why>"
-    },
-    "selected_structure": {
-      "source_article": <article_id>,
-      "structure_type": "<e.g., Problem-Solution-CTA>",
-      "section_flow": ["<section 1>", "<section 2>", "..."],
-      "rationale": "<why this structure>"
-    },
-    "selected_arguments": {
-      "primary_source": <article_id>,
-      "core_thesis": "<the main argument to use>",
-      "supporting_points": [
-        {
-          "point": "<the point>",
-          "source_article": <article_id>
-        }
-      ],
-      "rationale": "<why these arguments>"
-    },
-    "selected_evidence": [
-      {
-        "evidence": "<specific statistic, example, or proof point>",
-        "source_article": <article_id>,
-        "where_to_use": "<which section this supports>"
-      }
-    ],
-    "phrases_to_preserve": [
-      {
-        "phrase": "<verbatim memorable phrase>",
-        "source_article": <article_id>,
-        "suggested_placement": "<where in the final article>"
-      }
-    ],
-    "elements_to_avoid": [
-      "<specific weakness from source articles to NOT carry over>"
-    ],
-    "synthesis_notes": "<any additional guidance for the synthesis agent about tone, length, or approach>"
-  },
-  "confidence": {
-    "level": "<high/medium/low>",
-    "concerns": ["<any concerns about combining these elements>"]
-  }
-}"""
+    system_prompt = read_reference_file("prompts/pipeline_stage3_select_system.md")
 
     user_prompt = f"""Analyze these {len(cards)} article drafts and create a synthesis blueprint.
 
@@ -829,7 +681,7 @@ Respond with only the JSON object."""
 
 
 # ============================================================================
-# PIPELINE STAGE 4: SYNTHESIZE
+# PIPELINE STAGE 5: SYNTHESIZE
 # Purpose: Generate final article from synthesis blueprint
 # ============================================================================
 
@@ -855,46 +707,16 @@ def synthesize_final_article(
     """
     if verbose:
         print(f"\n{'='*80}")
-        print("PIPELINE STAGE 4: SYNTHESIZE")
+        print("PIPELINE STAGE 5: SYNTHESIZE")
         print(f"{'='*80}")
         print(f"Generating final article from blueprint...")
     
-    system_prompt = f"""You are a professional content writer. You will receive a synthesis blueprint that specifies exactly what elements to include in a marketing blog article.
-
-Your job is to write a cohesive, polished article that incorporates all specified elements naturally.
-
-## Brand Guidelines
-{brand_guidelines}
-
-## Target Length
-Approximately {target_word_count} words.
-
-## Writing Instructions
-
-1. USE THE SPECIFIED HEADLINE exactly as provided
-2. FOLLOW THE SPECIFIED STRUCTURE - use the section flow as your outline
-3. INCORPORATE THE CORE ARGUMENT as the thesis
-4. WEAVE IN THE SUPPORTING POINTS in the appropriate sections
-5. INCLUDE THE SELECTED EVIDENCE where specified
-6. PRESERVE THE MEMORABLE PHRASES - work them in naturally, verbatim
-7. AVOID THE LISTED WEAKNESSES - don't repeat these mistakes
-
-## Critical Rules
-
-- Do NOT invent new arguments or evidence not in the blueprint
-- Do NOT change the core thesis
-- The memorable phrases should appear VERBATIM - they were selected for a reason
-- Transitions between sections should feel natural, not forced
-- The tone should be consistent throughout
-
-## Output Format
-
-Return ONLY the article text. No meta-commentary, no "Here's the article:", just the article itself starting with the headline.
-
-Format:
-# [Headline]
-
-[Article body with natural paragraph breaks]"""
+    # Load prompt template and substitute variables
+    prompt_template = read_reference_file("prompts/pipeline_stage4_synthesize_system.md")
+    system_prompt = prompt_template.format(
+        brand_guidelines=brand_guidelines,
+        target_word_count=target_word_count
+    )
 
     user_prompt = f"""Write a marketing blog article following this synthesis blueprint.
 
@@ -925,7 +747,7 @@ Write the complete article now. Start directly with the headline."""
 
 
 # ============================================================================
-# PIPELINE STAGE 5: VALIDATE
+# PIPELINE STAGE 6: VALIDATE
 # Purpose: Verify synthesized article meets quality standards
 # ============================================================================
 
@@ -949,7 +771,7 @@ def validate_synthesized_article(
     """
     if verbose:
         print(f"\n{'='*80}")
-        print("PIPELINE STAGE 5: VALIDATE")
+        print("PIPELINE STAGE 6: VALIDATE")
         print(f"{'='*80}")
         print("Validating synthesized article...")
     
@@ -957,76 +779,15 @@ def validate_synthesized_article(
     avg_source_score = sum(s.overall_score for s in original_scores) / len(original_scores)
     target_threshold = avg_source_score + 0.5
     
-    system_prompt = f"""You are a content quality assurance agent. You will receive:
-1. A synthesized article
-2. The blueprint it was supposed to follow
-3. A target quality threshold
-
-Your job is to verify the article meets requirements and identify any issues.
-
-You must respond with ONLY a valid JSON object.
-
-## Validation Checks
-
-1. BLUEPRINT COMPLIANCE
-   - Does the article use the specified headline?
-   - Does it follow the specified structure?
-   - Does it include the core argument?
-   - Are the supporting points present?
-   - Is the evidence included where specified?
-   - Are the memorable phrases preserved verbatim?
-   - Does it avoid the listed weaknesses?
-
-2. QUALITY ASSESSMENT
-   - Score the final article on the same criteria used for source articles
-   - Compare to target threshold
-
-3. COHERENCE CHECK
-   - Does the article flow naturally?
-   - Are transitions smooth?
-   - Is the tone consistent?
-   - Does it feel like one coherent piece (not Frankenstein'd together)?
-
-## Output Schema
-
-{{
-  "passed": <boolean>,
-  "blueprint_compliance": {{
-    "headline_used": <boolean>,
-    "structure_followed": <boolean>,
-    "core_argument_present": <boolean>,
-    "supporting_points_included": <float 0-1, what percentage>,
-    "evidence_included": <float 0-1>,
-    "phrases_preserved": <float 0-1>,
-    "weaknesses_avoided": <boolean>,
-    "compliance_score": <float 0-1>
-  }},
-  "quality_scores": {{
-    "hook_strength": <1-10>,
-    "argument_clarity": <1-10>,
-    "evidence_quality": <1-10>,
-    "structural_coherence": <1-10>,
-    "originality": <1-10>,
-    "memorability": <1-10>,
-    "actionability": <1-10>,
-    "overall": <float>
-  }},
-  "coherence_assessment": {{
-    "flow_natural": <boolean>,
-    "transitions_smooth": <boolean>,
-    "tone_consistent": <boolean>,
-    "feels_unified": <boolean>
-  }},
-  "issues": [
-    "<specific issue 1>",
-    "<specific issue 2>"
-  ],
-  "improvement_suggestions": [
-    "<specific suggestion if failed>"
-  ],
-  "target_threshold": {target_threshold},
-  "threshold_met": <boolean>
-}}"""
+    # Load writing style content for reference
+    writing_style_content = read_reference_file("reference_context/writing_style-enhanced.md")
+    
+    # Load prompt template and substitute variables
+    prompt_template = read_reference_file("prompts/pipeline_stage5_validate_system.md")
+    system_prompt = prompt_template.format(
+        target_threshold=target_threshold,
+        writing_style_guide=writing_style_content
+    )
 
     user_prompt = f"""Validate this synthesized article against its blueprint.
 
@@ -1164,11 +925,11 @@ class ArticleSynthesisPipeline:
             Dict with final_article, validation, and all intermediate artifacts
         """
         try:
-            # STAGE 1: EXTRACT
+            # STAGE 2: EXTRACT
             cards = extract_all_article_cards(candidates, self.verbose)
             self.artifacts['cards'] = cards
             
-            # STAGE 2: SCORE
+            # STAGE 3: SCORE
             scores = score_all_cards_with_voting(
                 cards,
                 votes=scoring_votes,
@@ -1176,11 +937,11 @@ class ArticleSynthesisPipeline:
             )
             self.artifacts['scores'] = scores
             
-            # STAGE 3: SELECT
+            # STAGE 4: SELECT
             blueprint = select_best_elements(cards, scores, self.verbose)
             self.artifacts['blueprint'] = blueprint
             
-            # STAGE 4 & 5: SYNTHESIZE + VALIDATE (with retry loop)
+            # STAGE 5 & 6: SYNTHESIZE + VALIDATE (with retry loop)
             final_article, validation = synthesize_with_validation_loop(
                 blueprint=blueprint,
                 original_user_prompt=original_user_prompt,
@@ -1379,7 +1140,7 @@ def main():
             print("Built system and user prompts from reference context files")
         
         # ====================================================================
-        # PHASE 1: GENERATION (existing code, modified to store candidates)
+        # STAGE 1: Generation of candidate articles
         # ====================================================================
         
         candidates = []
@@ -1431,7 +1192,7 @@ def main():
                     print(f"Candidate saved: {filename}")
         
         # ====================================================================
-        # PHASE 2: SYNTHESIS PIPELINE (new code)
+        # STAGES 2-6: SYNTHESIS PIPELINE
         # ====================================================================
         
         if args.enable_synthesis:
