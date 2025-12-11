@@ -886,18 +886,16 @@ You must respond with ONLY a valid JSON object.
   "threshold_met": <boolean>
 }}"""
 
-    # Load writing style content for reference
-#    writing_style_content = read_reference_file("reference_context/writing_style-enhanced.md")
-    
+'''
     # Load prompt template and substitute variables
-#    prompt_template = read_reference_file("prompts/pipeline_stage6_validate_system.md")
-#    system_prompt = prompt_template.format(
-#        target_threshold=target_threshold,
-#        writing_style_guide=writing_style_content
-#    )
+    prompt_template = read_reference_file("prompts/pipeline_stage6_validate_system.md")
+    system_prompt = prompt_template.format(
+        target_threshold=target_threshold
+    )
 
     user_prompt = f"""Validate this synthesized article against its blueprint.
-
+'''
+    
 ## Synthesized Article
 {article}
 
