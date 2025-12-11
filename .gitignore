@@ -1,0 +1,16 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+
+# Outputs folder
+outputs/
+
+# Environment variables
+.env
+
+# IDE
+.vscode/

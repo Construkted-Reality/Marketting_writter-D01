@@ -4,7 +4,7 @@ Simple script to generate marketing blog posts using a local OpenAI compliant AP
 Based on the reference implementation pattern from cr_content_pipeline.py
 Uses built-in system and user prompts for Construkted Reality marketing content.
 
-Enhanced with 5-stage article synthesis pipeline: EXTRACT → SCORE → SELECT → SYNTHESIZE → VALIDATE
+Enhanced with 6-stage article synthesis pipeline: CANDIDATES → EXTRACT → SCORE → SELECT → SYNTHESIZE → VALIDATE
 """
 
 import argparse
@@ -76,7 +76,7 @@ class ValidationResult:
     """Quality assessment of synthesized article (VALIDATE stage output)."""
     passed: bool
     blueprint_compliance: Dict[str, any]
-    quality_scores: Dict[str, int]
+    quality_scores: Dict[str, float]
     coherence_assessment: Dict[str, bool]
     issues: List[str]
     improvement_suggestions: List[str]
@@ -207,6 +207,31 @@ def filter_think_tags(text: str) -> str:
     # Clean up any extra whitespace that might be left
     filtered_text = re.sub(r'\n\s*\n', '\n\n', filtered_text)
     return filtered_text.strip()
+
+
+def extract_json_from_response(text: str) -> str:
+    """
+    Extract JSON from LLM response, handling markdown code blocks.
+    
+    Args:
+        text: The text potentially containing JSON
+        
+    Returns:
+        Extracted JSON string
+    """
+    # Remove think tags first
+    text = filter_think_tags(text)
+    
+    # Try to extract JSON from markdown code blocks
+    # Pattern for ```json ... ``` or ``` ... ```
+    code_block_pattern = r'```(?:json)?\s*\n?(.*?)\n?```'
+    match = re.search(code_block_pattern, text, re.DOTALL)
+    
+    if match:
+        return match.group(1).strip()
+    
+    # If no code block found, return the text as-is (might already be pure JSON)
+    return text.strip()
 
 
 def build_user_prompt(topic_file: str) -> str:
@@ -348,7 +373,7 @@ def extract_article_card(
     Returns:
         ArticleCard with structured data
     """
-    system_prompt = read_reference_file("prompts/pipeline_stage1_extract_system.md")
+    system_prompt = read_reference_file("prompts/pipeline_stage2_extract_system.md")
 
     user_prompt = f"""Extract the article card for Article #{article_id}.
 
@@ -368,11 +393,11 @@ Respond with only the JSON object."""
                 verbose=verbose
             )
             
-            # Filter out think tags from reasoning model output
-            response = filter_think_tags(response)
+            # Extract JSON from response (handles markdown code blocks and think tags)
+            json_str = extract_json_from_response(response)
             
             # Parse and validate JSON
-            card_data = json.loads(response)
+            card_data = json.loads(json_str)
             
             # Validate required fields
             required_fields = [
@@ -464,7 +489,7 @@ def score_article_card(
     Returns:
         ArticleScore with scores and justifications
     """
-    system_prompt = read_reference_file("prompts/pipeline_stage2_score_system.md")
+    system_prompt = read_reference_file("prompts/pipeline_stage3_score_system.md")
 
     user_prompt = f"""Score the following article card against the provided criteria.
 
@@ -484,10 +509,10 @@ Respond with only the JSON object containing scores and justifications."""
         verbose=verbose
     )
     
-    # Filter out think tags from reasoning model output
-    response = filter_think_tags(response)
+    # Extract JSON from response (handles markdown code blocks and think tags)
+    json_str = extract_json_from_response(response)
     
-    score_data = json.loads(response)
+    score_data = json.loads(json_str)
     
     # Calculate weighted overall score
     total_score = 0.0
@@ -644,7 +669,7 @@ def select_best_elements(
             "overall_score": score.overall_score
         })
     
-    system_prompt = read_reference_file("prompts/pipeline_stage3_select_system.md")
+    system_prompt = read_reference_file("prompts/pipeline_stage4_select_system.md")
 
     user_prompt = f"""Analyze these {len(cards)} article drafts and create a synthesis blueprint.
 
@@ -663,10 +688,21 @@ Respond with only the JSON object."""
         verbose=verbose
     )
     
-    # Filter out think tags from reasoning model output
-    response = filter_think_tags(response)
+    # Extract JSON from response (handles markdown code blocks and think tags)
+    json_str = extract_json_from_response(response)
     
-    blueprint_data = json.loads(response)
+    # Debug: Check if response is empty after extraction
+    if not json_str or json_str.isspace():
+        raise ValueError("Empty response after filtering. LLM may have only returned thinking content or invalid format.")
+    
+    try:
+        blueprint_data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        # Provide more context in error message
+        if verbose:
+            print(f"\nFailed to parse JSON response:")
+            print(f"Extracted JSON preview: {json_str[:500]}")
+        raise ValueError(f"Invalid JSON response from LLM: {e}. JSON preview: {json_str[:200]}")
     
     # Create blueprint with all required fields including confidence
     blueprint_dict = blueprint_data["synthesis_blueprint"].copy()
@@ -712,7 +748,7 @@ def synthesize_final_article(
         print(f"Generating final article from blueprint...")
     
     # Load prompt template and substitute variables
-    prompt_template = read_reference_file("prompts/pipeline_stage4_synthesize_system.md")
+    prompt_template = read_reference_file("prompts/pipeline_stage5_synthesize_system.md")
     system_prompt = prompt_template.format(
         brand_guidelines=brand_guidelines,
         target_word_count=target_word_count
@@ -783,7 +819,7 @@ def validate_synthesized_article(
     writing_style_content = read_reference_file("reference_context/writing_style-enhanced.md")
     
     # Load prompt template and substitute variables
-    prompt_template = read_reference_file("prompts/pipeline_stage5_validate_system.md")
+    prompt_template = read_reference_file("prompts/pipeline_stage6_validate_system.md")
     system_prompt = prompt_template.format(
         target_threshold=target_threshold,
         writing_style_guide=writing_style_content
@@ -810,10 +846,10 @@ Evaluate and respond with the validation JSON."""
         verbose=verbose
     )
     
-    # Filter out think tags from reasoning model output
-    response = filter_think_tags(response)
+    # Extract JSON from response (handles markdown code blocks and think tags)
+    json_str = extract_json_from_response(response)
     
-    validation_data = json.loads(response)
+    validation_data = json.loads(json_str)
     result = ValidationResult(**validation_data)
     
     if verbose:
@@ -836,7 +872,7 @@ def synthesize_with_validation_loop(
     target_word_count: int = 1500,
     max_retries: int = 3,
     verbose: bool = False
-) -> tuple[str, ValidationResult]:
+) -> tuple[str, ValidationResult | None]:
     """
     Synthesize article with validation retry loop.
     
