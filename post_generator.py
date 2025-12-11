@@ -773,7 +773,7 @@ Write the complete article now. Start directly with the headline."""
     )
     
     # Filter out think tags from reasoning model output
-    #article = filter_think_tags(article)
+    article = filter_think_tags(article)
     
     if verbose:
         word_count = len(article.split())
@@ -886,16 +886,8 @@ You must respond with ONLY a valid JSON object.
   "threshold_met": <boolean>
 }}"""
 
-'''
-    # Load prompt template and substitute variables
-    prompt_template = read_reference_file("prompts/pipeline_stage6_validate_system.md")
-    system_prompt = prompt_template.format(
-        target_threshold=target_threshold
-    )
-
     user_prompt = f"""Validate this synthesized article against its blueprint.
-'''
-    
+
 ## Synthesized Article
 {article}
 
@@ -1301,10 +1293,6 @@ def main():
         # ====================================================================
         
         if args.enable_synthesis:
-            print(f"\n{'='*80}")
-            print("STARTING SYNTHESIS PIPELINE")
-            print(f"{'='*80}\n")
-            
             pipeline = ArticleSynthesisPipeline(verbose=args.verbose)
             
             result = pipeline.run(
