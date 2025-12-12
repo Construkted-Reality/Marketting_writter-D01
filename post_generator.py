@@ -162,7 +162,7 @@ class ArticleCard:
 class ArticleScore:
     """Quality scores for an article card (SCORE stage output)."""
     article_id: int
-    scores: Dict[str, Dict[str, any]]  # criterion_name -> {score: int, justification: str}
+    scores: Dict[str, Dict[str, Any]]  # criterion_name -> {score: int, justification: str}
     overall_score: float
     standout_strengths: List[str]
     critical_weaknesses: List[str]
@@ -170,21 +170,21 @@ class ArticleScore:
 @dataclass
 class SynthesisBlueprint:
     """Specification for combining best elements (SELECT stage output)."""
-    selected_headline: Dict[str, any]
-    selected_opening: Dict[str, any]
-    selected_structure: Dict[str, any]
-    selected_arguments: Dict[str, any]
-    selected_evidence: List[Dict[str, any]]
-    phrases_to_preserve: List[Dict[str, any]]
+    selected_headline: Dict[str, Any]
+    selected_opening: Dict[str, Any]
+    selected_structure: Dict[str, Any]
+    selected_arguments: Dict[str, Any]
+    selected_evidence: List[Dict[str, Any]]
+    phrases_to_preserve: List[Dict[str, Any]]
     elements_to_avoid: List[str]
     synthesis_notes: str
-    confidence: Dict[str, any]
+    confidence: Dict[str, Any]
 
 @dataclass
 class ValidationResult:
     """Quality assessment of synthesized article (VALIDATE stage output)."""
     passed: bool
-    blueprint_compliance: Dict[str, any]
+    blueprint_compliance: Dict[str, Any]
     quality_scores: Dict[str, int]
     coherence_assessment: Dict[str, bool]
     issues: List[str]
@@ -331,8 +331,8 @@ def cleanup_old_outputs(days_to_keep: int = 30) -> None:
                         print(f"Removed: {output_dir}")
 
 def send_to_llm(
-    user_prompt: str,
-    system_prompt: Optional[str] = None,
+    llm_user_prompt: str,
+    llm_system_prompt: Optional[str] = None,
     temperature: float = 0.7,
     max_tokens: int = 4000,
     retry_count: int = 3,
@@ -343,8 +343,8 @@ def send_to_llm(
     Send prompt to the local OpenAI compliant API endpoint.
     
     Args:
-        user_prompt: User prompt/instruction
-        system_prompt: System prompt (uses built-in prompt if None)
+        llm_user_prompt: User prompt/instruction
+        llm_system_prompt: System prompt (uses built-in prompt if None)
         temperature: Sampling temperature (default 0.7)
         max_tokens: Maximum tokens to generate (default 4000)
         retry_count: Number of API call retries (default 3)
@@ -361,13 +361,13 @@ def send_to_llm(
     )
     
     # Use built-in system prompt if none provided
-    if system_prompt is None:
+    if llm_system_prompt is None:
         print ("WARNING: System prompt missing.")
     
     # Prepare messages for the API
     messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
+        {"role": "system", "content": llm_system_prompt},
+        {"role": "user", "content": llm_user_prompt}
     ]
     
     # Get model name from environment
@@ -430,9 +430,9 @@ def extract_article_card(
     Returns:
         ArticleCard with structured data
     """
-    system_prompt = read_reference_file("prompts/pipeline_stage2_extract_system.md")
+    extract_system_prompt = read_reference_file("prompts/pipeline_stage2_extract_system.md")
 
-    user_prompt = f"""Extract the article card for Article #{article_id}.
+    extract_user_prompt = f"""Extract the article card for Article #{article_id}.
 
 <article>
 {article_content}
@@ -443,13 +443,13 @@ Respond with only the JSON object."""
     for attempt in range(retry_count):
         try:
             # Prepare input text for metrics tracking
-            input_text = system_prompt + "\n\n" + user_prompt
+            input_text = extract_system_prompt + "\n\n" + extract_user_prompt
             
             # Send to LLM with timing
             llm_start_time = time.time()
             response = send_to_llm(
-                user_prompt=user_prompt,
-                system_prompt=system_prompt,
+                llm_user_prompt=extract_user_prompt,
+                llm_system_prompt=extract_system_prompt,
                 temperature=0.3,  # Low temp for consistent extraction
                 max_tokens=4000,
                 verbose=verbose
@@ -542,7 +542,7 @@ def extract_all_article_cards(
 
 def score_article_card(
     card: ArticleCard,
-    criteria: Dict[str, Dict[str, any]],
+    criteria: Dict[str, Dict[str, Any]],
     verbose: bool = False
 ) -> ArticleScore:
     """
@@ -556,9 +556,9 @@ def score_article_card(
     Returns:
         ArticleScore with scores and justifications
     """
-    system_prompt = read_reference_file("prompts/pipeline_stage3_score_system.md")
+    score_system_prompt = read_reference_file("prompts/pipeline_stage3_score_system.md")
 
-    user_prompt = f"""Score the following article card against the provided criteria.
+    score_user_prompt = f"""Score the following article card against the provided criteria.
 
 ## Article Card
 {json.dumps(card.__dict__, indent=2)}
@@ -569,13 +569,13 @@ def score_article_card(
 Respond with only the JSON object containing scores and justifications."""
 
     # Prepare input text for metrics tracking
-    input_text = system_prompt + "\n\n" + user_prompt
+    input_text = score_system_prompt + "\n\n" + score_user_prompt
     
     # Send to LLM with timing
     llm_start_time = time.time()
     response = send_to_llm(
-        user_prompt=user_prompt,
-        system_prompt=system_prompt,
+        llm_user_prompt=score_user_prompt,
+        llm_system_prompt=score_system_prompt,
         temperature=0.2,  # Low temp for consistent evaluation
         max_tokens=4000,
         verbose=verbose
@@ -650,7 +650,7 @@ def average_score_votes(votes: List[ArticleScore]) -> ArticleScore:
 
 def score_all_cards_with_voting(
     cards: List[ArticleCard],
-    criteria: Dict[str, Dict[str, any]] = SCORING_CRITERIA,
+    criteria: Dict[str, Dict[str, Any]] = SCORING_CRITERIA,
     votes: int = 3,
     verbose: bool = False
 ) -> List[ArticleScore]:
@@ -746,9 +746,9 @@ def select_best_elements(
             "overall_score": score.overall_score
         })
     
-    system_prompt = read_reference_file("prompts/pipeline_stage4_select_system.md")
+    select_system_prompt = read_reference_file("prompts/pipeline_stage4_select_system.md")
 
-    user_prompt = f"""Analyze these {len(cards)} article drafts and create a synthesis blueprint.
+    select_user_prompt = f"""Analyze these {len(cards)} article drafts and create a synthesis blueprint.
 
 ## Article Summaries and Scores
 {json.dumps(analysis_input, indent=2)}
@@ -758,13 +758,13 @@ Create a synthesis blueprint that combines the best elements into one superior a
 Respond with only the JSON object."""
 
     # Prepare input text for metrics tracking
-    input_text = system_prompt + "\n\n" + user_prompt
+    input_text = select_system_prompt + "\n\n" + select_user_prompt
     
     # Send to LLM with timing
     llm_start_time = time.time()
     response = send_to_llm(
-        user_prompt=user_prompt,
-        system_prompt=system_prompt,
+        llm_user_prompt=select_user_prompt,
+        llm_system_prompt=select_system_prompt,
         temperature=0.4,  # Some analytical creativity
         max_tokens=6000,
         verbose=verbose
@@ -841,13 +841,13 @@ def synthesize_final_article(
     prompt_template = read_reference_file("prompts/pipeline_stage5_synthesize_system.md")
     writing_style_content = read_reference_file("reference_context/writing_style-enhanced.md")
 
-    system_prompt = prompt_template.format(
+    synthesize_system_prompt = prompt_template.format(
         brand_guidelines=brand_guidelines,
         writing_style_content = writing_style_content,
         target_word_count=target_word_count
     )
 
-    user_prompt = f"""Write a marketing blog article following this synthesis blueprint.
+    synthesize_user_prompt = f"""Write a marketing blog article following this synthesis blueprint.
 ## Original Brief
 {original_user_prompt}
 
@@ -857,13 +857,13 @@ def synthesize_final_article(
 Write the complete article now. Start directly with the headline."""
 
     # Prepare input text for metrics tracking
-    input_text = system_prompt + "\n\n" + user_prompt
+    input_text = synthesize_system_prompt + "\n\n" + synthesize_user_prompt
     
     # Send to LLM with timing
     llm_start_time = time.time()
     article = send_to_llm(
-        user_prompt=user_prompt,
-        system_prompt=system_prompt,
+        llm_user_prompt=synthesize_user_prompt,
+        llm_system_prompt=synthesize_system_prompt,
         temperature=0.7,  # Higher temp for creative writing
         max_tokens=8000,
         verbose=verbose
@@ -917,7 +917,7 @@ def validate_synthesized_article(
     avg_source_score = sum(s.overall_score for s in original_scores) / len(original_scores)
     target_threshold = avg_source_score + 0.5
     
-    system_prompt = f"""You are a content quality assurance agent. You will receive:
+    validate_system_prompt = f"""You are a content quality assurance agent. You will receive:
 1. A synthesized article
 2. The blueprint it was supposed to follow
 3. A target quality threshold
@@ -988,7 +988,7 @@ You must respond with ONLY a valid JSON object.
   "threshold_met": <boolean>
 }}"""
 
-    user_prompt = f"""Validate this synthesized article against its blueprint.
+    validate_user_prompt = f"""Validate this synthesized article against its blueprint.
 
 ## Synthesized Article
 {article}
@@ -1002,13 +1002,13 @@ The article should achieve an overall score of at least {target_threshold:.1f}
 Evaluate and respond with the validation JSON."""
 
     # Prepare input text for metrics tracking
-    input_text = system_prompt + "\n\n" + user_prompt
+    input_text = validate_system_prompt + "\n\n" + validate_user_prompt
     
     # Send to LLM with timing
     llm_start_time = time.time()
     response = send_to_llm(
-        user_prompt=user_prompt,
-        system_prompt=system_prompt,
+        llm_user_prompt=validate_user_prompt,
+        llm_system_prompt=validate_system_prompt,
         temperature=0.2,  # Low temp for consistent judgment
         max_tokens=4000,
         verbose=verbose
@@ -1375,7 +1375,7 @@ def main():
         construkted_context_content = read_reference_file("reference_context/construkted_context.md")
         
         # Build the system prompt by combining all content
-        system_prompt = f"""You are a masterful marketing copywriter for the company Construkted Reality. You generate engaging blog articles using the style guide provided.
+        generation_system_prompt = f"""You are a masterful marketing copywriter for the company Construkted Reality. You generate engaging blog articles using the style guide provided.
 
 WRITING STYLE GUIDE:
 {writing_style_content}
@@ -1394,7 +1394,7 @@ When writing marketing content, always:
 5. Focus on the benefits of user-generated 3D data and community collaboration
 6. Avoid corporate jargon and speak directly to both professionals and hobbyists"""
 
-        user_prompt = read_reference_file(args.topic_file)
+        generation_user_prompt = read_reference_file(args.topic_file)
         
         if args.verbose:
             print("Built system and user prompts from reference context files")
@@ -1411,13 +1411,13 @@ When writing marketing content, always:
                 print(f"\nGenerating candidate {iteration}/{args.iterations}...")
             
             # Prepare input text for metrics tracking
-            input_text = system_prompt + "\n\n" + user_prompt
+            input_text = generation_system_prompt + "\n\n" + generation_user_prompt
             
             # Send to LLM with timing
             llm_start_time = time.time()
             response = send_to_llm(
-                user_prompt=user_prompt,
-                system_prompt=system_prompt,
+                llm_user_prompt=generation_user_prompt,
+                llm_system_prompt=generation_system_prompt,
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
                 retry_count=args.retry_count,
@@ -1474,8 +1474,8 @@ When writing marketing content, always:
             
             result = pipeline.run(
                 candidates=candidates,
-                original_user_prompt=user_prompt,
-                brand_guidelines=system_prompt,
+                original_user_prompt=generation_user_prompt,
+                brand_guidelines="",
                 target_word_count=args.target_word_count,
                 scoring_votes=args.synthesis_votes,
                 max_synthesis_retries=args.synthesis_retries
