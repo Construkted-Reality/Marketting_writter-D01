@@ -15,7 +15,9 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1209,8 +1211,11 @@ class ArticleSynthesisPipeline:
 # Global metrics object to track all pipeline stages
 pipeline_metrics = PipelineMetrics()
 
+# Thread lock for metrics tracking
+_metrics_lock = threading.Lock()
+
 def track_llm_call(stage_name: str, input_text: str, output_text: str, execution_time: float):
-    """Track a single LLM call with timing and token metrics."""
+    """Track a single LLM call with timing and token metrics (thread-safe)."""
     stage_mapping = {
         "CANDIDATES": pipeline_metrics.candidates_stage,
         "EXTRACT": pipeline_metrics.extract_stage,
@@ -1221,11 +1226,12 @@ def track_llm_call(stage_name: str, input_text: str, output_text: str, execution
     }
     
     if stage_name in stage_mapping:
-        stage = stage_mapping[stage_name]
-        stage.add_input(input_text)
-        stage.add_output(output_text)
-        stage.add_execution_time(execution_time)
-        stage.llm_calls += 1
+        with _metrics_lock:
+            stage = stage_mapping[stage_name]
+            stage.add_input(input_text)
+            stage.add_output(output_text)
+            stage.add_execution_time(execution_time)
+            stage.llm_calls += 1
 
 def save_pipeline_artifacts(
     result: Dict,
@@ -1278,6 +1284,209 @@ def save_pipeline_artifacts(
     )
     if verbose:
         print(f"✓ Pipeline artifacts saved: {artifacts_path}")
+
+
+# ============================================================================
+# PARALLEL ARTICLE GENERATION
+# ============================================================================
+
+def generate_single_candidate(
+    iteration: int,
+    generation_system_prompt: str,
+    generation_user_prompt: str,
+    temperature: float,
+    max_tokens: int,
+    retry_count: int,
+    retry_delay: float,
+    filter_think: bool,
+    verbose: bool
+) -> ArticleCandidate:
+    """
+    Generate a single article candidate (thread-safe worker function).
+    
+    Args:
+        iteration: Candidate iteration number
+        generation_system_prompt: System prompt for generation
+        generation_user_prompt: User prompt for generation
+        temperature: Sampling temperature
+        max_tokens: Maximum tokens to generate
+        retry_count: Number of API call retries
+        retry_delay: Delay between retries
+        filter_think: Whether to filter think tags
+        verbose: Enable verbose logging
+        
+    Returns:
+        ArticleCandidate object
+    """
+    if verbose:
+        print(f"  [Thread {threading.current_thread().name}] Generating candidate {iteration}...")
+    
+    # Prepare input text for metrics tracking
+    input_text = generation_system_prompt + "\n\n" + generation_user_prompt
+    
+    # Send to LLM with timing
+    llm_start_time = time.time()
+    response = send_to_llm(
+        llm_user_prompt=generation_user_prompt,
+        llm_system_prompt=generation_system_prompt,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        retry_count=retry_count,
+        retry_delay=retry_delay,
+        verbose=False  # Disable verbose in worker threads to reduce output clutter
+    )
+    llm_end_time = time.time()
+    execution_time = llm_end_time - llm_start_time
+    
+    # Apply think tag filtering if requested
+    if filter_think:
+        response = filter_think_tags(response)
+    
+    # Track LLM call metrics (thread-safe)
+    track_llm_call("CANDIDATES", input_text, response, execution_time)
+    
+    # Create candidate object
+    candidate = ArticleCandidate(
+        article_id=iteration,
+        content=response,
+        word_count=len(response.split()),
+        generation_timestamp=time.time()
+    )
+    
+    if verbose:
+        print(f"  [Thread {threading.current_thread().name}] ✓ Candidate {iteration} complete ({candidate.word_count} words)")
+    
+    return candidate
+
+
+def save_candidate_file(
+    candidate: ArticleCandidate,
+    output_dir: Path,
+    output_base: str,
+    total_iterations: int,
+    verbose: bool
+) -> None:
+    """
+    Save a single candidate file (thread-safe).
+    
+    Args:
+        candidate: ArticleCandidate to save
+        output_dir: Output directory path
+        output_base: Base filename
+        total_iterations: Total number of iterations
+        verbose: Enable verbose logging
+    """
+    if total_iterations == 1:
+        filename = output_dir / f"{output_base}.md"
+    else:
+        filename = output_dir / "candidates" / f"{output_base}_candidate_{candidate.article_id:02d}.md"
+    
+    filename.write_text(
+        candidate.content + f"\n\n---\n**Word Count: {candidate.word_count}**",
+        encoding='utf-8'
+    )
+    
+    if verbose:
+        print(f"  Candidate {candidate.article_id} saved: {filename}")
+
+
+def generate_candidates_parallel(
+    iterations: int,
+    generation_system_prompt: str,
+    generation_user_prompt: str,
+    temperature: float,
+    max_tokens: int,
+    retry_count: int,
+    retry_delay: float,
+    filter_think: bool,
+    output_base: Optional[str],
+    max_concurrent: int = 5,
+    verbose: bool = False
+) -> List[ArticleCandidate]:
+    """
+    Generate multiple article candidates in parallel using ThreadPoolExecutor.
+    
+    Args:
+        iterations: Number of candidates to generate
+        generation_system_prompt: System prompt for generation
+        generation_user_prompt: User prompt for generation
+        temperature: Sampling temperature
+        max_tokens: Maximum tokens to generate
+        retry_count: Number of API call retries
+        retry_delay: Delay between retries
+        filter_think: Whether to filter think tags
+        output_base: Base filename for outputs (optional)
+        max_concurrent: Maximum concurrent LLM requests
+        verbose: Enable verbose logging
+        
+    Returns:
+        List of ArticleCandidate objects
+    """
+    if verbose:
+        print(f"\n{'='*80}")
+        print(f"PARALLEL CANDIDATE GENERATION")
+        print(f"{'='*80}")
+        print(f"Generating {iterations} candidates with max {max_concurrent} concurrent requests...")
+    
+    candidates = []
+    
+    # Create output directory if needed
+    output_dir = None
+    if output_base:
+        output_dir = create_output_directory(output_base)
+    
+    # Use ThreadPoolExecutor for parallel generation
+    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+        # Submit all generation tasks
+        future_to_iteration = {
+            executor.submit(
+                generate_single_candidate,
+                iteration,
+                generation_system_prompt,
+                generation_user_prompt,
+                temperature,
+                max_tokens,
+                retry_count,
+                retry_delay,
+                filter_think,
+                verbose
+            ): iteration
+            for iteration in range(1, iterations + 1)
+        }
+        
+        # Collect results as they complete
+        completed = 0
+        for future in as_completed(future_to_iteration):
+            iteration = future_to_iteration[future]
+            try:
+                candidate = future.result()
+                candidates.append(candidate)
+                completed += 1
+                
+                if verbose:
+                    print(f"Progress: {completed}/{iterations} candidates complete")
+                
+                # Save candidate file if output is specified
+                if output_base and output_dir:
+                    save_candidate_file(
+                        candidate,
+                        output_dir,
+                        output_base,
+                        iterations,
+                        verbose=False  # Reduce verbosity in parallel mode
+                    )
+                    
+            except Exception as e:
+                if verbose:
+                    print(f"  ✗ Candidate {iteration} failed: {e}")
+    
+    # Sort candidates by article_id to maintain order
+    candidates.sort(key=lambda c: c.article_id)
+    
+    if verbose:
+        print(f"✓ Parallel generation complete: {len(candidates)}/{iterations} candidates generated\n")
+    
+    return candidates
 
 
 def main():
@@ -1366,6 +1575,17 @@ def main():
         default=0,
         help="Remove output directories older than N days (0 = disabled)"
     )
+    parser.add_argument(
+        "--parallel",
+        action="store_true",
+        help="Enable parallel article generation (recommended for --iterations >= 5)"
+    )
+    parser.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=10,
+        help="Maximum concurrent LLM requests when using --parallel (default: 5)"
+    )
     
     args = parser.parse_args()
     
@@ -1428,63 +1648,82 @@ When writing marketing content, always:
         # STAGE 1: Generation of candidate articles
         # ====================================================================
         
-        candidates = []
         stage_start_time = time.time()
         
-        for iteration in range(1, args.iterations + 1):
-            if args.verbose:
-                print(f"\nGenerating candidate {iteration}/{args.iterations}...")
-            
-            # Prepare input text for metrics tracking
-            input_text = generation_system_prompt + "\n\n" + generation_user_prompt
-            
-            # Send to LLM with timing
-            llm_start_time = time.time()
-            response = send_to_llm(
-                llm_user_prompt=generation_user_prompt,
-                llm_system_prompt=generation_system_prompt,
+        # Choose parallel or sequential generation
+        if args.parallel:
+            # Parallel generation using ThreadPoolExecutor
+            candidates = generate_candidates_parallel(
+                iterations=args.iterations,
+                generation_system_prompt=generation_system_prompt,
+                generation_user_prompt=generation_user_prompt,
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
                 retry_count=args.retry_count,
                 retry_delay=args.retry_delay,
+                filter_think=args.filter_think,
+                output_base=args.output,
+                max_concurrent=args.max_concurrent,
                 verbose=args.verbose
             )
-            llm_end_time = time.time()
-            execution_time = llm_end_time - llm_start_time
+        else:
+            # Sequential generation (original implementation)
+            candidates = []
             
-            # Apply think tag filtering if requested
-            if args.filter_think:
+            for iteration in range(1, args.iterations + 1):
                 if args.verbose:
-                    print("Filtering out content between <think> tags...")
-                response = filter_think_tags(response)
-            
-            # Track LLM call metrics
-            track_llm_call("CANDIDATES", input_text, response, execution_time)
-            
-            # Store candidate in memory
-            candidate = ArticleCandidate(
-                article_id=iteration,
-                content=response,
-                word_count=len(response.split()),
-                generation_timestamp=time.time()
-            )
-            candidates.append(candidate)
-            
-            # Save individual candidate files to organized structure
-            if args.output:
-                output_dir = create_output_directory(args.output)
+                    print(f"\nGenerating candidate {iteration}/{args.iterations}...")
                 
-                if args.iterations == 1:
-                    filename = output_dir / f"{args.output}.md"
-                else:
-                    filename = output_dir / "candidates" / f"{args.output}_candidate_{iteration:02d}.md"
+                # Prepare input text for metrics tracking
+                input_text = generation_system_prompt + "\n\n" + generation_user_prompt
                 
-                filename.write_text(
-                    response + f"\n\n---\n**Word Count: {candidate.word_count}**",
-                    encoding='utf-8'
+                # Send to LLM with timing
+                llm_start_time = time.time()
+                response = send_to_llm(
+                    llm_user_prompt=generation_user_prompt,
+                    llm_system_prompt=generation_system_prompt,
+                    temperature=args.temperature,
+                    max_tokens=args.max_tokens,
+                    retry_count=args.retry_count,
+                    retry_delay=args.retry_delay,
+                    verbose=args.verbose
                 )
-                if args.verbose:
-                    print(f"Candidate saved: {filename}")
+                llm_end_time = time.time()
+                execution_time = llm_end_time - llm_start_time
+                
+                # Apply think tag filtering if requested
+                if args.filter_think:
+                    if args.verbose:
+                        print("Filtering out content between <think> tags...")
+                    response = filter_think_tags(response)
+                
+                # Track LLM call metrics
+                track_llm_call("CANDIDATES", input_text, response, execution_time)
+                
+                # Store candidate in memory
+                candidate = ArticleCandidate(
+                    article_id=iteration,
+                    content=response,
+                    word_count=len(response.split()),
+                    generation_timestamp=time.time()
+                )
+                candidates.append(candidate)
+                
+                # Save individual candidate files to organized structure
+                if args.output:
+                    output_dir = create_output_directory(args.output)
+                    
+                    if args.iterations == 1:
+                        filename = output_dir / f"{args.output}.md"
+                    else:
+                        filename = output_dir / "candidates" / f"{args.output}_candidate_{iteration:02d}.md"
+                    
+                    filename.write_text(
+                        response + f"\n\n---\n**Word Count: {candidate.word_count}**",
+                        encoding='utf-8'
+                    )
+                    if args.verbose:
+                        print(f"Candidate saved: {filename}")
         
         # Add total execution time for candidates stage
         stage_end_time = time.time()
