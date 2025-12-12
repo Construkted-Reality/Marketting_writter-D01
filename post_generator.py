@@ -893,16 +893,20 @@ def validate_synthesized_article(
     article: str,
     blueprint: SynthesisBlueprint,
     original_scores: List[ArticleScore],
-    verbose: bool = False
+    verbose: bool = False,
+    validation_retry_count: int = 3,
+    validation_retry_delay: float = 2.0
 ) -> ValidationResult:
     """
-    Validate that synthesized article meets quality standards.
+    Validate that synthesized article meets quality standards with retry loop.
     
     Args:
         article: Synthesized article text
         blueprint: SynthesisBlueprint it should follow
         original_scores: Scores from source articles
         verbose: Enable progress logging
+        validation_retry_count: Number of validation retry attempts (default: 3)
+        validation_retry_delay: Delay between validation retries in seconds (default: 2.0)
         
     Returns:
         ValidationResult with pass/fail and detailed feedback
@@ -1004,37 +1008,56 @@ Evaluate and respond with the validation JSON."""
     # Prepare input text for metrics tracking
     input_text = validate_system_prompt + "\n\n" + validate_user_prompt
     
-    # Send to LLM with timing
-    llm_start_time = time.time()
-    response = send_to_llm(
-        llm_user_prompt=validate_user_prompt,
-        llm_system_prompt=validate_system_prompt,
-        temperature=0.2,  # Low temp for consistent judgment
-        max_tokens=4000,
-        verbose=verbose
-    )
-    llm_end_time = time.time()
-    execution_time = llm_end_time - llm_start_time
+    last_error = None
+    for attempt in range(validation_retry_count):
+        try:
+            if verbose and attempt > 0:
+                print(f"  Validation retry attempt {attempt + 1}/{validation_retry_count}...")
+            
+            # Send to LLM with timing
+            llm_start_time = time.time()
+            response = send_to_llm(
+                llm_user_prompt=validate_user_prompt,
+                llm_system_prompt=validate_system_prompt,
+                temperature=0.2,  # Low temp for consistent judgment
+                max_tokens=4000,
+                verbose=verbose
+            )
+            llm_end_time = time.time()
+            execution_time = llm_end_time - llm_start_time
+            
+            # Extract JSON from response (handles markdown code blocks and think tags)
+            json_str = extract_json_from_response(response)
+            
+            validation_data = json.loads(json_str)
+            result = ValidationResult(**validation_data)
+            
+            # Track LLM call metrics
+            track_llm_call("VALIDATE", input_text, json_str, execution_time)
+            
+            if verbose:
+                status = "✓ PASSED" if result.passed else "✗ FAILED"
+                print(f"{status} - Overall score: {result.quality_scores['overall']:.1f} (threshold: {target_threshold:.1f})")
+                if not result.passed and result.issues:
+                    print(f"  Issues identified: {len(result.issues)}")
+                    for issue in result.issues[:3]:  # Show first 3
+                        print(f"    - {issue}")
+                print()
+            
+            return result
+            
+        except (json.JSONDecodeError, ValueError) as e:
+            last_error = e
+            if verbose:
+                print(f"  ⚠ Validation attempt {attempt + 1} failed: {e}")
+            
+            if attempt < validation_retry_count - 1:  # Don't sleep on the last attempt
+                if verbose:
+                    print(f"  Retrying validation in {validation_retry_delay} seconds...")
+                time.sleep(validation_retry_delay)
     
-    # Extract JSON from response (handles markdown code blocks and think tags)
-    json_str = extract_json_from_response(response)
-    
-    validation_data = json.loads(json_str)
-    result = ValidationResult(**validation_data)
-    
-    # Track LLM call metrics
-    track_llm_call("VALIDATE", input_text, json_str, execution_time)
-    
-    if verbose:
-        status = "✓ PASSED" if result.passed else "✗ FAILED"
-        print(f"{status} - Overall score: {result.quality_scores['overall']:.1f} (threshold: {target_threshold:.1f})")
-        if not result.passed and result.issues:
-            print(f"  Issues identified: {len(result.issues)}")
-            for issue in result.issues[:3]:  # Show first 3
-                print(f"    - {issue}")
-        print()
-    
-    return result
+    # If we get here, all validation retries failed
+    raise RuntimeError(f"Failed to validate article after {validation_retry_count} attempts. Last error: {last_error}")
 
 
 def synthesize_with_validation_loop(
@@ -1082,7 +1105,9 @@ def synthesize_with_validation_loop(
             article=article,
             blueprint=blueprint,
             original_scores=original_scores,
-            verbose=verbose
+            verbose=verbose,
+            validation_retry_count=3,
+            validation_retry_delay=2.0
         )
         
         if validation.passed:
