@@ -260,45 +260,6 @@ def read_reference_file(file_path: str) -> str:
         raise RuntimeError(f"Failed to read reference file {file_path}: {e}")
 
 
-def build_system_prompt() -> str:
-    """
-    Build the system prompt by combining content from reference files.
-    
-    Returns:
-        The complete system prompt string
-    """
-    try:
-        # Read the three reference context files
-        writing_style_content = read_reference_file("reference_context/writing_style-enhanced.md")
-        market_analysis_content = read_reference_file("reference_context/Combined_Small_Team_Geospatial_Market_Analysis.md")
-        construkted_context_content = read_reference_file("reference_context/construkted_context.md")
-        
-        # Build the system prompt by combining all content
-        system_prompt = f"""You are a masterful marketing copywriter for the company Construkted Reality. You generate engaging blog articles using the style guide provided.
-
-WRITING STYLE GUIDE:
-{writing_style_content}
-
-COMPANY CONTEXT:
-{construkted_context_content}
-
-MARKET RESEARCH CONTEXT:
-{market_analysis_content}
-
-When writing marketing content, always:
-1. Follow the writing style guidelines precisely
-2. Incorporate company context and mission naturally
-3. Reference market insights where relevant to strengthen arguments
-4. Maintain an engaging, conversational tone that educates while exciting
-5. Focus on the benefits of user-generated 3D data and community collaboration
-6. Avoid corporate jargon and speak directly to both professionals and hobbyists"""
-        
-        return system_prompt
-        
-    except Exception as e:
-        raise RuntimeError(f"Failed to build system prompt: {e}")
-
-
 def filter_think_tags(text: str) -> str:
     """
     Filter out content between <think> and </think> tags.
@@ -341,19 +302,6 @@ def extract_json_from_response(text: str) -> str:
     
     # If no code block found, return the text as-is (might already be pure JSON)
     return text.strip()
-
-
-def build_user_prompt(topic_file: str) -> str:
-    """
-    Build the user prompt for blog post generation.
-    
-    Args:
-        topic_file: Path to a file containing the specific blog post topic/idea
-        
-    Returns:
-        The user prompt string
-    """
-    return read_reference_file(topic_file)
 
 def create_output_directory(base_name: str) -> Path:
     """Create organized output directory structure."""
@@ -414,7 +362,7 @@ def send_to_llm(
     
     # Use built-in system prompt if none provided
     if system_prompt is None:
-        system_prompt = build_system_prompt()
+        print ("WARNING: System prompt missing.")
     
     # Prepare messages for the API
     messages = [
@@ -824,6 +772,9 @@ Respond with only the JSON object."""
     llm_end_time = time.time()
     execution_time = llm_end_time - llm_start_time
     
+    # Filter out think tags from reasoning model output
+    response = filter_think_tags(response)
+
     # Extract JSON from response (handles markdown code blocks and think tags)
     json_str = extract_json_from_response(response)
     
@@ -888,13 +839,15 @@ def synthesize_final_article(
     
     # Load prompt template and substitute variables
     prompt_template = read_reference_file("prompts/pipeline_stage5_synthesize_system.md")
+    writing_style_content = read_reference_file("reference_context/writing_style-enhanced.md")
+
     system_prompt = prompt_template.format(
         brand_guidelines=brand_guidelines,
+        writing_style_content = writing_style_content,
         target_word_count=target_word_count
     )
 
     user_prompt = f"""Write a marketing blog article following this synthesis blueprint.
-
 ## Original Brief
 {original_user_prompt}
 
@@ -1196,8 +1149,9 @@ class ArticleSynthesisPipeline:
             # STAGE 4: SELECT
             blueprint = select_best_elements(cards, scores, self.verbose)
             self.artifacts['blueprint'] = blueprint
-            
-            # STAGE 5 & 6: SYNTHESIZE + VALIDATE (with retry loop)
+
+            # STAGE 5 & 6: SYNTHESIZE + VALIDATE (with retry loop)            
+
             final_article, validation = synthesize_with_validation_loop(
                 blueprint=blueprint,
                 original_user_prompt=original_user_prompt,
@@ -1414,7 +1368,6 @@ def main():
             print("Using built-in system and user prompts for Construkted Reality marketing content")
         
         # Build prompts
-        #system_prompt = build_system_prompt()
 
         # Read the three reference context files
         writing_style_content = read_reference_file("reference_context/writing_style-enhanced.md")
@@ -1441,7 +1394,6 @@ When writing marketing content, always:
 5. Focus on the benefits of user-generated 3D data and community collaboration
 6. Avoid corporate jargon and speak directly to both professionals and hobbyists"""
 
-        #user_prompt = build_user_prompt(args.topic_file)
         user_prompt = read_reference_file(args.topic_file)
         
         if args.verbose:

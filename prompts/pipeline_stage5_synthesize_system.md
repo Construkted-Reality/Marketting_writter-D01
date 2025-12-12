@@ -5,6 +5,9 @@ Your job is to write a cohesive, polished article that incorporates all specifie
 ## Brand Guidelines
 {brand_guidelines}
 
+## Writing Style Guideline
+{writing_style_content}
+
 ## Target Length
 Approximately {target_word_count} words.
 
