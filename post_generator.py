@@ -538,6 +538,170 @@ def extract_all_article_cards(
 
 
 # ============================================================================
+# PARALLEL EXTRACTION INFRASTRUCTURE
+# ============================================================================
+
+class ThreadSafeExtractionMetrics:
+    """Thread-safe metrics tracking for parallel extraction operations."""
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._extraction_metrics = StageMetrics("EXTRACT")
+        
+    def track_extraction_call_safe(self, input_text: str, output_text: str, execution_time: float):
+        """Thread-safe version of extraction metrics tracking."""
+        with self._lock:
+            self._extraction_metrics.add_input(input_text)
+            self._extraction_metrics.add_output(output_text)
+            self._extraction_metrics.add_execution_time(execution_time)
+            self._extraction_metrics.llm_calls += 1
+
+
+class ThreadSafeProgressTracker:
+    """Thread-safe progress tracking for parallel operations."""
+    
+    def __init__(self, total_items: int, stage_name: str, verbose: bool = False):
+        self.total = total_items
+        self.completed = 0
+        self.stage_name = stage_name
+        self.verbose = verbose
+        self.lock = threading.Lock()
+        
+    def update_progress(self, item_id: int, status: str = "completed"):
+        """Thread-safe progress updates."""
+        with self.lock:
+            self.completed += 1
+            if self.verbose and self.completed % max(1, self.total // 10) == 0:
+                percentage = (self.completed / self.total) * 100
+                print(f"[{self.stage_name}] Progress: {self.completed}/{self.total} ({percentage:.1f}%) - {status}")
+
+
+class ThreadSafeErrorCollector:
+    """Thread-safe error collection for parallel operations."""
+    
+    def __init__(self):
+        self.errors = []
+        self.lock = threading.Lock()
+        
+    def add_error(self, item_id: int, error: Exception):
+        """Thread-safe error collection."""
+        with self.lock:
+            self.errors.append({
+                'item_id': item_id,
+                'error': str(error),
+                'timestamp': time.time()
+            })
+            
+    def get_errors(self) -> List[Dict]:
+        """Get all collected errors."""
+        with self.lock:
+            return self.errors.copy()
+
+
+def extract_single_card_worker(
+    candidate: ArticleCandidate,
+    retry_count: int,
+    verbose: bool
+) -> ArticleCard:
+    """
+    Worker function for parallel card extraction.
+    
+    Args:
+        candidate: ArticleCandidate to extract
+        retry_count: Number of retry attempts for failed extractions
+        verbose: Enable progress logging
+        
+    Returns:
+        ArticleCard object
+    """
+    try:
+        card = extract_article_card(
+            article_content=candidate.content,
+            article_id=candidate.article_id,
+            verbose=False,  # Reduce verbosity in workers
+            retry_count=retry_count
+        )
+        return card
+    except Exception as e:
+        raise RuntimeError(f"Failed to extract Article #{candidate.article_id}: {e}")
+
+
+def extract_all_article_cards_parallel(
+    candidates: List[ArticleCandidate],
+    max_concurrent: int = 5,
+    verbose: bool = False,
+    retry_count: int = 3
+) -> List[ArticleCard]:
+    """
+    Extract article cards from all candidates in parallel using ThreadPoolExecutor.
+    
+    Args:
+        candidates: List of generated article candidates
+        max_concurrent: Maximum concurrent LLM requests
+        verbose: Enable progress logging
+        retry_count: Number of retry attempts for failed extractions
+        
+    Returns:
+        List of ArticleCard objects
+    """
+    if verbose:
+        print(f"\n{'='*80}")
+        print("PARALLEL EXTRACTION STAGE")
+        print(f"{'='*80}")
+        print(f"Extracting {len(candidates)} cards with max {max_concurrent} concurrent requests...")
+    
+    progress_tracker = ThreadSafeProgressTracker(len(candidates), "EXTRACT", verbose)
+    error_collector = ThreadSafeErrorCollector()
+    
+    def worker_extract_card(candidate: ArticleCandidate) -> ArticleCard:
+        """Worker function for parallel extraction."""
+        try:
+            card = extract_article_card(
+                article_content=candidate.content,
+                article_id=candidate.article_id,
+                verbose=False,  # Reduce verbosity in workers
+                retry_count=retry_count
+            )
+            progress_tracker.update_progress(candidate.article_id, "extracted")
+            return card
+        except Exception as e:
+            error_collector.add_error(candidate.article_id, e)
+            progress_tracker.update_progress(candidate.article_id, f"failed: {e}")
+            raise  # Re-raise to be handled by ThreadPoolExecutor
+    
+    # Execute parallel extraction
+    cards = []
+    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+        future_to_candidate = {
+            executor.submit(worker_extract_card, candidate): candidate.article_id
+            for candidate in candidates
+        }
+        
+        for future in as_completed(future_to_candidate):
+            candidate_id = future_to_candidate[future]
+            try:
+                card = future.result()
+                cards.append(card)
+            except Exception as e:
+                if verbose:
+                    print(f"  ✗ Failed to extract Article #{candidate_id}: {e}")
+                # Continue with other cards
+    
+    # Report final statistics
+    if verbose:
+        successful = len(cards)
+        failed = len(error_collector.get_errors())
+        print(f"✓ Parallel extraction complete: {successful}/{len(candidates)} cards extracted")
+        if failed > 0:
+            print(f"  Failed extractions: {failed}")
+            for error in error_collector.get_errors()[:3]:  # Show first 3
+                print(f"    - Article #{error['item_id']}: {error['error']}")
+        print()
+    
+    return cards
+
+
+# ============================================================================
 # PIPELINE STAGE 3: SCORE
 # Purpose: Evaluate article cards on quality dimensions with voting
 # ============================================================================
@@ -1144,7 +1308,9 @@ class ArticleSynthesisPipeline:
         brand_guidelines: str,
         target_word_count: int = 1500,
         scoring_votes: int = 3,
-        max_synthesis_retries: int = 3
+        max_synthesis_retries: int = 3,
+        parallel_processing: bool = False,
+        max_concurrent: int = 5
     ) -> Dict:
         """
         Execute complete pipeline.
@@ -1156,13 +1322,22 @@ class ArticleSynthesisPipeline:
             target_word_count: Desired final article length
             scoring_votes: Number of voting rounds for scoring
             max_synthesis_retries: Max synthesis attempts on validation failure
+            parallel_processing: Enable parallel processing for extraction stage
+            max_concurrent: Maximum concurrent requests for extraction stage
             
         Returns:
             Dict with final_article, validation, and all intermediate artifacts
         """
         try:
-            # STAGE 2: EXTRACT
-            cards = extract_all_article_cards(candidates, self.verbose)
+            # STAGE 2: EXTRACT (with optional parallel processing)
+            if parallel_processing:
+                cards = extract_all_article_cards_parallel(
+                    candidates=candidates,
+                    max_concurrent=max_concurrent,
+                    verbose=self.verbose
+                )
+            else:
+                cards = extract_all_article_cards(candidates, self.verbose)
             self.artifacts['cards'] = cards
             
             # STAGE 3: SCORE
@@ -1177,7 +1352,7 @@ class ArticleSynthesisPipeline:
             blueprint = select_best_elements(cards, scores, self.verbose)
             self.artifacts['blueprint'] = blueprint
 
-            # STAGE 5 & 6: SYNTHESIZE + VALIDATE (with retry loop)            
+            # STAGE 5 & 6: SYNTHESIZE + VALIDATE (with retry loop)
 
             final_article, validation = synthesize_with_validation_loop(
                 blueprint=blueprint,
@@ -1583,7 +1758,7 @@ def main():
     parser.add_argument(
         "--max-concurrent",
         type=int,
-        default=10,
+        default=15,
         help="Maximum concurrent LLM requests when using --parallel (default: 5)"
     )
     
@@ -1742,7 +1917,9 @@ When writing marketing content, always:
                 brand_guidelines="",
                 target_word_count=args.target_word_count,
                 scoring_votes=args.synthesis_votes,
-                max_synthesis_retries=args.synthesis_retries
+                max_synthesis_retries=args.synthesis_retries,
+                parallel_processing=args.parallel,
+                max_concurrent=args.max_concurrent
             )
             
             # Save all pipeline outputs
