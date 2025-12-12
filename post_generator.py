@@ -871,6 +871,141 @@ def score_all_cards_with_voting(
 
 
 # ============================================================================
+# PARALLEL SCORING INFRASTRUCTURE
+# ============================================================================
+
+class ThreadSafeScoringMetrics:
+    """Thread-safe metrics tracking for parallel scoring operations."""
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._scoring_metrics = StageMetrics("SCORE")
+        
+    def track_scoring_call_safe(self, input_text: str, output_text: str, execution_time: float):
+        """Thread-safe version of scoring metrics tracking."""
+        with self._lock:
+            self._scoring_metrics.add_input(input_text)
+            self._scoring_metrics.add_output(output_text)
+            self._scoring_metrics.add_execution_time(execution_time)
+            self._scoring_metrics.llm_calls += 1
+
+
+def score_single_vote_worker(
+    card: ArticleCard,
+    criteria: Dict[str, Dict[str, Any]],
+    vote_number: int,
+    verbose: bool
+) -> ArticleScore:
+    """
+    Worker function for parallel single vote scoring.
+    
+    Args:
+        card: ArticleCard to score
+        criteria: Scoring criteria dictionary
+        vote_number: Vote number (1-indexed)
+        verbose: Enable progress logging
+        
+    Returns:
+        ArticleScore object
+    """
+    try:
+        score = score_article_card(card, criteria, verbose=False)
+        return score
+    except Exception as e:
+        raise RuntimeError(f"Failed to score vote {vote_number} for card {card.article_id}: {e}")
+
+
+def score_all_cards_with_voting_parallel(
+    cards: List[ArticleCard],
+    max_concurrent: int = 5,
+    votes: int = 3,
+    criteria: Dict[str, Dict[str, Any]] = SCORING_CRITERIA,
+    verbose: bool = False
+) -> List[ArticleScore]:
+    """
+    Score all cards with voting in parallel using ThreadPoolExecutor.
+    
+    Args:
+        cards: List of ArticleCards to score
+        max_concurrent: Maximum concurrent LLM requests
+        votes: Number of voting rounds per card
+        criteria: Scoring criteria dictionary
+        verbose: Enable progress logging
+        
+    Returns:
+        List of averaged ArticleScore objects
+    """
+    if verbose:
+        print(f"\n{'='*80}")
+        print("PARALLEL SCORING STAGE")
+        print(f"{'='*80}")
+        print(f"Scoring {len(cards)} cards with {votes} votes each, max {max_concurrent} concurrent...")
+    
+    total_scoring_operations = len(cards) * votes
+    progress_tracker = ThreadSafeProgressTracker(total_scoring_operations, "SCORE", verbose)
+    error_collector = ThreadSafeErrorCollector()
+    
+    def worker_score_single_vote(card: ArticleCard, vote_number: int) -> ArticleScore:
+        """Worker function for single vote scoring."""
+        try:
+            score = score_article_card(card, criteria, verbose=False)
+            progress_tracker.update_progress(f"{card.article_id}-{vote_number}", f"vote{vote_number}_completed")
+            return score
+        except Exception as e:
+            error_collector.add_error(f"{card.article_id}-{vote_number}", e)
+            progress_tracker.update_progress(f"{card.article_id}-{vote_number}", f"vote{vote_number}_failed: {e}")
+            raise
+    
+    def worker_score_all_votes_for_card(card: ArticleCard) -> ArticleScore:
+        """Worker function to score one card with all votes."""
+        card_votes = []
+        for vote_num in range(votes):
+            try:
+                vote_score = worker_score_single_vote(card, vote_num + 1)
+                card_votes.append(vote_score)
+            except Exception as e:
+                if verbose:
+                    print(f"    ⚠ Vote {vote_num + 1} failed for card {card.article_id}: {e}")
+        
+        if card_votes:
+            return average_score_votes(card_votes)
+        else:
+            raise RuntimeError(f"All votes failed for card {card.article_id}")
+    
+    # Execute parallel scoring
+    all_scores = []
+    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+        future_to_card = {
+            executor.submit(worker_score_all_votes_for_card, card): card.article_id
+            for card in cards
+        }
+        
+        for future in as_completed(future_to_card):
+            card_id = future_to_card[future]
+            try:
+                score = future.result()
+                all_scores.append(score)
+                if verbose:
+                    print(f"  ✓ Card #{card_id} scored: {score.overall_score}")
+            except Exception as e:
+                if verbose:
+                    print(f"  ✗ Failed to score Card #{card_id}: {e}")
+    
+    # Report final statistics
+    if verbose:
+        scores_list = [s.overall_score for s in all_scores]
+        print(f"✓ Parallel scoring complete: {len(all_scores)}/{len(cards)} cards scored")
+        if scores_list:
+            print(f"  Score range: {min(scores_list):.1f} - {max(scores_list):.1f}")
+        failed = len(error_collector.get_errors())
+        if failed > 0:
+            print(f"  Failed scoring operations: {failed}")
+        print()
+    
+    return all_scores
+
+
+# ============================================================================
 # PIPELINE STAGE 4: SELECT
 # Purpose: Analyze scores and select best elements for synthesis
 # ============================================================================
@@ -1340,12 +1475,20 @@ class ArticleSynthesisPipeline:
                 cards = extract_all_article_cards(candidates, self.verbose)
             self.artifacts['cards'] = cards
             
-            # STAGE 3: SCORE
-            scores = score_all_cards_with_voting(
-                cards,
-                votes=scoring_votes,
-                verbose=self.verbose
-            )
+            # STAGE 3: SCORE (with optional parallel processing)
+            if parallel_processing:
+                scores = score_all_cards_with_voting_parallel(
+                    cards=cards,
+                    max_concurrent=max_concurrent,
+                    votes=scoring_votes,
+                    verbose=self.verbose
+                )
+            else:
+                scores = score_all_cards_with_voting(
+                    cards,
+                    votes=scoring_votes,
+                    verbose=self.verbose
+                )
             self.artifacts['scores'] = scores
             
             # STAGE 4: SELECT
