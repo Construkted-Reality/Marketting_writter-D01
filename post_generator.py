@@ -5,6 +5,8 @@ Based on the reference implementation pattern from cr_content_pipeline.py
 Uses built-in system and user prompts for Construkted Reality marketing content.
 
 Enhanced with 6-stage article synthesis pipeline: CANDIDATES → EXTRACT → SCORE → SELECT → SYNTHESIZE → VALIDATE
+
+Includes comprehensive metrics tracking for words, tokens, and execution times.
 """
 
 import argparse
@@ -20,6 +22,113 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from openai import OpenAI
+
+# ============================================================================
+# METRICS TRACKING SYSTEM
+# ============================================================================
+
+@dataclass
+class StageMetrics:
+    """Metrics for a single pipeline stage."""
+    stage_name: str
+    input_words: int = 0
+    input_tokens: int = 0
+    output_words: int = 0
+    output_tokens: int = 0
+    execution_time: float = 0.0
+    llm_calls: int = 0
+    
+    def add_input(self, text: str):
+        """Add input text and calculate tokens."""
+        words = len(text.split())
+        tokens = int(words / 0.75)  # Simple token estimator: word count / 0.75
+        self.input_words += words
+        self.input_tokens += tokens
+    
+    def add_output(self, text: str):
+        """Add output text and calculate tokens."""
+        words = len(text.split())
+        tokens = int(words / 0.75)  # Simple token estimator: word count / 0.75
+        self.output_words += words
+        self.output_tokens += tokens
+    
+    def add_execution_time(self, duration: float):
+        """Add execution time."""
+        self.execution_time += duration
+    
+    def get_total_words(self) -> int:
+        """Get total words (input + output)."""
+        return self.input_words + self.output_words
+    
+    def get_total_tokens(self) -> int:
+        """Get total tokens (input + output)."""
+        return self.input_tokens + self.output_tokens
+
+@dataclass
+class PipelineMetrics:
+    """Complete metrics for the entire pipeline execution."""
+    candidates_stage: StageMetrics = field(default_factory=lambda: StageMetrics("CANDIDATES"))
+    extract_stage: StageMetrics = field(default_factory=lambda: StageMetrics("EXTRACT"))
+    score_stage: StageMetrics = field(default_factory=lambda: StageMetrics("SCORE"))
+    select_stage: StageMetrics = field(default_factory=lambda: StageMetrics("SELECT"))
+    synthesize_stage: StageMetrics = field(default_factory=lambda: StageMetrics("SYNTHESIZE"))
+    validate_stage: StageMetrics = field(default_factory=lambda: StageMetrics("VALIDATE"))
+    total_execution_time: float = 0.0
+    
+    def get_stage_metrics(self) -> List[StageMetrics]:
+        """Get list of all stage metrics."""
+        return [
+            self.candidates_stage,
+            self.extract_stage,
+            self.score_stage,
+            self.select_stage,
+            self.synthesize_stage,
+            self.validate_stage
+        ]
+    
+    def get_total_words_all_stages(self) -> int:
+        """Get total words across all stages."""
+        return sum(stage.get_total_words() for stage in self.get_stage_metrics())
+    
+    def get_total_tokens_all_stages(self) -> int:
+        """Get total tokens across all stages."""
+        return sum(stage.get_total_tokens() for stage in self.get_stage_metrics())
+    
+    def get_total_llm_calls(self) -> int:
+        """Get total LLM calls across all stages."""
+        return sum(stage.llm_calls for stage in self.get_stage_metrics())
+    
+    def print_comprehensive_summary(self):
+        """Print detailed metrics summary."""
+        print(f"\n{'='*100}")
+        print("COMPREHENSIVE PIPELINE METRICS SUMMARY")
+        print(f"{'='*100}")
+        
+        # Stage-by-stage breakdown
+        for stage in self.get_stage_metrics():
+            if stage.llm_calls > 0:  # Only show stages that executed
+                print(f"\n{stage.stage_name} STAGE:")
+                print(f"  LLM Calls: {stage.llm_calls}")
+                print(f"  Input: {stage.input_words:,} words ({stage.input_tokens:,} tokens)")
+                print(f"  Output: {stage.output_words:,} words ({stage.output_tokens:,} tokens)")
+                print(f"  Total: {stage.get_total_words():,} words ({stage.get_total_tokens():,} tokens)")
+                print(f"  Execution Time: {stage.execution_time:.2f} seconds")
+        
+        # Totals
+        total_words = self.get_total_words_all_stages()
+        total_tokens = self.get_total_tokens_all_stages()
+        total_calls = self.get_total_llm_calls()
+        
+        print(f"\n{'='*100}")
+        print("OVERALL TOTALS:")
+        print(f"{'='*100}")
+        print(f"Total LLM Calls: {total_calls}")
+        print(f"Total Words Processed: {total_words:,}")
+        print(f"Total Tokens Processed: {total_tokens:,}")
+        print(f"Total Execution Time: {self.total_execution_time:.2f} seconds")
+        if total_calls > 0:
+            print(f"Average Time per LLM Call: {self.total_execution_time/total_calls:.2f} seconds")
+        print(f"{'='*100}\n")
 
 # ============================================================================
 # DATA STRUCTURES FOR ARTICLE SYNTHESIS PIPELINE
@@ -385,6 +494,11 @@ Respond with only the JSON object."""
 
     for attempt in range(retry_count):
         try:
+            # Prepare input text for metrics tracking
+            input_text = system_prompt + "\n\n" + user_prompt
+            
+            # Send to LLM with timing
+            llm_start_time = time.time()
             response = send_to_llm(
                 user_prompt=user_prompt,
                 system_prompt=system_prompt,
@@ -392,6 +506,8 @@ Respond with only the JSON object."""
                 max_tokens=4000,
                 verbose=verbose
             )
+            llm_end_time = time.time()
+            execution_time = llm_end_time - llm_start_time
             
             # Extract JSON from response (handles markdown code blocks and think tags)
             json_str = extract_json_from_response(response)
@@ -413,6 +529,9 @@ Respond with only the JSON object."""
             
             # Create ArticleCard object
             card = ArticleCard(**card_data)
+            
+            # Track LLM call metrics
+            track_llm_call("EXTRACT", input_text, json_str, execution_time)
             
             if verbose:
                 print(f"  ✓ Extracted card for Article #{article_id}")
@@ -501,6 +620,11 @@ def score_article_card(
 
 Respond with only the JSON object containing scores and justifications."""
 
+    # Prepare input text for metrics tracking
+    input_text = system_prompt + "\n\n" + user_prompt
+    
+    # Send to LLM with timing
+    llm_start_time = time.time()
     response = send_to_llm(
         user_prompt=user_prompt,
         system_prompt=system_prompt,
@@ -508,6 +632,8 @@ Respond with only the JSON object containing scores and justifications."""
         max_tokens=4000,
         verbose=verbose
     )
+    llm_end_time = time.time()
+    execution_time = llm_end_time - llm_start_time
     
     # Extract JSON from response (handles markdown code blocks and think tags)
     json_str = extract_json_from_response(response)
@@ -523,6 +649,9 @@ Respond with only the JSON object containing scores and justifications."""
             total_score += score_value * weight
     
     score_data["overall_score"] = round(total_score, 2)
+    
+    # Track LLM call metrics
+    track_llm_call("SCORE", input_text, json_str, execution_time)
     
     return ArticleScore(**score_data)
 
@@ -680,6 +809,11 @@ Create a synthesis blueprint that combines the best elements into one superior a
 
 Respond with only the JSON object."""
 
+    # Prepare input text for metrics tracking
+    input_text = system_prompt + "\n\n" + user_prompt
+    
+    # Send to LLM with timing
+    llm_start_time = time.time()
     response = send_to_llm(
         user_prompt=user_prompt,
         system_prompt=system_prompt,
@@ -687,6 +821,8 @@ Respond with only the JSON object."""
         max_tokens=6000,
         verbose=verbose
     )
+    llm_end_time = time.time()
+    execution_time = llm_end_time - llm_start_time
     
     # Extract JSON from response (handles markdown code blocks and think tags)
     json_str = extract_json_from_response(response)
@@ -709,6 +845,9 @@ Respond with only the JSON object."""
     blueprint_dict["confidence"] = blueprint_data["confidence"]
     
     blueprint = SynthesisBlueprint(**blueprint_dict)
+    
+    # Track LLM call metrics
+    track_llm_call("SELECT", input_text, json_str, execution_time)
     
     if verbose:
         print(f"✓ Blueprint created. Confidence: {blueprint.confidence['level']}\n")
@@ -764,6 +903,11 @@ def synthesize_final_article(
 
 Write the complete article now. Start directly with the headline."""
 
+    # Prepare input text for metrics tracking
+    input_text = system_prompt + "\n\n" + user_prompt
+    
+    # Send to LLM with timing
+    llm_start_time = time.time()
     article = send_to_llm(
         user_prompt=user_prompt,
         system_prompt=system_prompt,
@@ -771,9 +915,14 @@ Write the complete article now. Start directly with the headline."""
         max_tokens=8000,
         verbose=verbose
     )
+    llm_end_time = time.time()
+    execution_time = llm_end_time - llm_start_time
     
     # Filter out think tags from reasoning model output
     article = filter_think_tags(article)
+    
+    # Track LLM call metrics
+    track_llm_call("SYNTHESIZE", input_text, article, execution_time)
     
     if verbose:
         word_count = len(article.split())
@@ -899,6 +1048,11 @@ The article should achieve an overall score of at least {target_threshold:.1f}
 
 Evaluate and respond with the validation JSON."""
 
+    # Prepare input text for metrics tracking
+    input_text = system_prompt + "\n\n" + user_prompt
+    
+    # Send to LLM with timing
+    llm_start_time = time.time()
     response = send_to_llm(
         user_prompt=user_prompt,
         system_prompt=system_prompt,
@@ -906,12 +1060,17 @@ Evaluate and respond with the validation JSON."""
         max_tokens=4000,
         verbose=verbose
     )
+    llm_end_time = time.time()
+    execution_time = llm_end_time - llm_start_time
     
     # Extract JSON from response (handles markdown code blocks and think tags)
     json_str = extract_json_from_response(response)
     
     validation_data = json.loads(json_str)
     result = ValidationResult(**validation_data)
+    
+    # Track LLM call metrics
+    track_llm_call("VALIDATE", input_text, json_str, execution_time)
     
     if verbose:
         status = "✓ PASSED" if result.passed else "✗ FAILED"
@@ -1063,6 +1222,31 @@ class ArticleSynthesisPipeline:
                 print(f"{'='*80}\n")
             raise
 
+
+# ============================================================================
+# GLOBAL METRICS TRACKING
+# ============================================================================
+
+# Global metrics object to track all pipeline stages
+pipeline_metrics = PipelineMetrics()
+
+def track_llm_call(stage_name: str, input_text: str, output_text: str, execution_time: float):
+    """Track a single LLM call with timing and token metrics."""
+    stage_mapping = {
+        "CANDIDATES": pipeline_metrics.candidates_stage,
+        "EXTRACT": pipeline_metrics.extract_stage,
+        "SCORE": pipeline_metrics.score_stage,
+        "SELECT": pipeline_metrics.select_stage,
+        "SYNTHESIZE": pipeline_metrics.synthesize_stage,
+        "VALIDATE": pipeline_metrics.validate_stage
+    }
+    
+    if stage_name in stage_mapping:
+        stage = stage_mapping[stage_name]
+        stage.add_input(input_text)
+        stage.add_output(output_text)
+        stage.add_execution_time(execution_time)
+        stage.llm_calls += 1
 
 def save_pipeline_artifacts(
     result: Dict,
@@ -1230,8 +1414,35 @@ def main():
             print("Using built-in system and user prompts for Construkted Reality marketing content")
         
         # Build prompts
-        system_prompt = build_system_prompt()
-        user_prompt = build_user_prompt(args.topic_file)
+        #system_prompt = build_system_prompt()
+
+        # Read the three reference context files
+        writing_style_content = read_reference_file("reference_context/writing_style-enhanced.md")
+        market_analysis_content = read_reference_file("reference_context/Combined_Small_Team_Geospatial_Market_Analysis.md")
+        construkted_context_content = read_reference_file("reference_context/construkted_context.md")
+        
+        # Build the system prompt by combining all content
+        system_prompt = f"""You are a masterful marketing copywriter for the company Construkted Reality. You generate engaging blog articles using the style guide provided.
+
+WRITING STYLE GUIDE:
+{writing_style_content}
+
+COMPANY CONTEXT:
+{construkted_context_content}
+
+MARKET RESEARCH CONTEXT:
+{market_analysis_content}
+
+When writing marketing content, always:
+1. Follow the writing style guidelines precisely
+2. Incorporate company context and mission naturally
+3. Reference market insights where relevant to strengthen arguments
+4. Maintain an engaging, conversational tone that educates while exciting
+5. Focus on the benefits of user-generated 3D data and community collaboration
+6. Avoid corporate jargon and speak directly to both professionals and hobbyists"""
+
+        #user_prompt = build_user_prompt(args.topic_file)
+        user_prompt = read_reference_file(args.topic_file)
         
         if args.verbose:
             print("Built system and user prompts from reference context files")
@@ -1241,12 +1452,17 @@ def main():
         # ====================================================================
         
         candidates = []
+        stage_start_time = time.time()
         
         for iteration in range(1, args.iterations + 1):
             if args.verbose:
                 print(f"\nGenerating candidate {iteration}/{args.iterations}...")
             
-            # Send to LLM
+            # Prepare input text for metrics tracking
+            input_text = system_prompt + "\n\n" + user_prompt
+            
+            # Send to LLM with timing
+            llm_start_time = time.time()
             response = send_to_llm(
                 user_prompt=user_prompt,
                 system_prompt=system_prompt,
@@ -1256,12 +1472,17 @@ def main():
                 retry_delay=args.retry_delay,
                 verbose=args.verbose
             )
+            llm_end_time = time.time()
+            execution_time = llm_end_time - llm_start_time
             
             # Apply think tag filtering if requested
             if args.filter_think:
                 if args.verbose:
                     print("Filtering out content between <think> tags...")
                 response = filter_think_tags(response)
+            
+            # Track LLM call metrics
+            track_llm_call("CANDIDATES", input_text, response, execution_time)
             
             # Store candidate in memory
             candidate = ArticleCandidate(
@@ -1287,6 +1508,10 @@ def main():
                 )
                 if args.verbose:
                     print(f"Candidate saved: {filename}")
+        
+        # Add total execution time for candidates stage
+        stage_end_time = time.time()
+        pipeline_metrics.candidates_stage.add_execution_time(stage_end_time - stage_start_time)
         
         # ====================================================================
         # STAGES 2-6: SYNTHESIS PIPELINE
@@ -1320,6 +1545,13 @@ def main():
             print(f"Validation passed: {result['validation'].passed}")
             print(f"Final article quality score: {result['validation'].quality_scores['overall']:.1f}/10")
             print(f"{'='*80}\n")
+        
+        # Track total execution time
+        total_end_time = time.time()
+        pipeline_metrics.total_execution_time = total_end_time - stage_start_time
+        
+        # Print comprehensive metrics summary
+        pipeline_metrics.print_comprehensive_summary()
         
         return 0
         
