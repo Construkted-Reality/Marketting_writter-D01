@@ -1,0 +1,3 @@
+- Have other models (local or external) write articles.
+    - for example have Opus wtrite 3 articles, Grok write 3 articles, DeepSeek write 3 srticles, etc.
+    - when voting, keep track of which LLM produced the highest scores in the votes. This is to have a way to track which LLMs are better (subjectively) at writing.
