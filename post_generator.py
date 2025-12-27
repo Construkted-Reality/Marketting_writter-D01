@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import statistics
 import sys
 import threading
 import time
@@ -200,31 +201,31 @@ class ValidationResult:
 
 SCORING_CRITERIA = {
     "hook_strength": {
-        "description": "How compelling is the opening? Does it create curiosity, tension, or immediate value?",
+        "description": "Evaluate: (1) specificity of opening detail, (2) presence of tension or curiosity gap, (3) immediate relevance signal. Score based on how many elements are present and effective.",
         "weight": 0.15
     },
     "argument_clarity": {
-        "description": "Is the core message immediately clear? Can you summarize it in one sentence?",
+        "description": "Test: Can you write a one-sentence summary of the core argument? Score based on how easily the thesis can be identified and whether supporting points reinforce it.",
         "weight": 0.20
     },
     "evidence_quality": {
-        "description": "Are claims supported with specifics? Statistics, examples, case studies?",
+        "description": "Count: specific statistics, named sources, concrete examples, case studies. Score based on quantity and specificity of supporting evidence.",
         "weight": 0.15
     },
     "structural_coherence": {
-        "description": "Does the structure serve the argument? Is there a logical flow?",
+        "description": "Check: clear section progression, logical transitions, each paragraph builds on previous. Score based on how well structure serves the argument.",
         "weight": 0.15
     },
     "originality": {
-        "description": "Does it offer a fresh angle? Or is it generic advice anyone could write?",
+        "description": "Assess: Does it challenge common assumptions? Offer a novel framework? Present an underexplored angle? Score based on freshness of perspective vs generic advice.",
         "weight": 0.15
     },
     "memorability": {
-        "description": "Are there phrases or ideas that stick? Would someone quote this?",
+        "description": "Identify: quotable phrases, sticky metaphors, concepts worth sharing. Score based on number and quality of memorable elements.",
         "weight": 0.10
     },
     "actionability": {
-        "description": "Does the reader know what to do after reading? Is there a clear next step?",
+        "description": "Evaluate: Are there specific next steps? How-to guidance? Implementation details? Score based on clarity and completeness of actionable takeaways.",
         "weight": 0.10
     }
 }
@@ -339,11 +340,12 @@ def send_to_llm(
     max_tokens: int = 4000,
     retry_count: int = 3,
     retry_delay: float = 1.0,
-    verbose: bool = False
+    verbose: bool = False,
+    seed: Optional[int] = None
 ) -> str:
     """
     Send prompt to the local OpenAI compliant API endpoint.
-    
+
     Args:
         llm_user_prompt: User prompt/instruction
         llm_system_prompt: System prompt (uses built-in prompt if None)
@@ -352,7 +354,8 @@ def send_to_llm(
         retry_count: Number of API call retries (default 3)
         retry_delay: Delay between retries in seconds (default 1.0)
         verbose: Enable verbose logging (default False)
-        
+        seed: Optional seed for reproducible outputs (default None)
+
     Returns:
         The LLM response content as a string
     """
@@ -381,12 +384,15 @@ def send_to_llm(
     for attempt in range(retry_count):
         try:
             # Make API call to the local OpenAI compliant endpoint
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=messages,  # type: ignore[arg-type]
-                temperature=temperature,
-                max_tokens=max_tokens
-            )
+            api_params = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens
+            }
+            if seed is not None:
+                api_params["seed"] = seed
+            response = client.chat.completions.create(**api_params)  # type: ignore[arg-type]
             
             # Extract and return the response content
             response_content = response.choices[0].message.content
@@ -418,17 +424,19 @@ def extract_article_card(
     article_content: str,
     article_id: int,
     verbose: bool = False,
-    retry_count: int = 3
+    retry_count: int = 3,
+    filter_think: bool = True
 ) -> ArticleCard:
     """
     Extract structured card from a single article.
-    
+
     Args:
         article_content: Full article text
         article_id: Unique identifier for this article
         verbose: Enable progress logging
         retry_count: Number of retry attempts for failed extractions
-        
+        filter_think: Whether to filter out think tags from response
+
     Returns:
         ArticleCard with structured data
     """
@@ -446,7 +454,7 @@ Respond with only the JSON object."""
         try:
             # Prepare input text for metrics tracking
             input_text = extract_system_prompt + "\n\n" + extract_user_prompt
-            
+
             # Send to LLM with timing
             llm_start_time = time.time()
             response = send_to_llm(
@@ -458,7 +466,11 @@ Respond with only the JSON object."""
             )
             llm_end_time = time.time()
             execution_time = llm_end_time - llm_start_time
-            
+
+            # Filter out think tags if requested
+            if filter_think:
+                response = filter_think_tags(response)
+
             # Extract JSON from response (handles markdown code blocks and think tags)
             json_str = extract_json_from_response(response)
             
@@ -499,15 +511,17 @@ Respond with only the JSON object."""
 
 def extract_all_article_cards(
     candidates: List[ArticleCandidate],
-    verbose: bool = False
+    verbose: bool = False,
+    filter_think: bool = True
 ) -> List[ArticleCard]:
     """
     Extract article cards from all candidates.
-    
+
     Args:
         candidates: List of generated article candidates
         verbose: Enable progress logging
-        
+        filter_think: Whether to filter out think tags from LLM responses
+
     Returns:
         List of ArticleCard objects
     """
@@ -516,14 +530,15 @@ def extract_all_article_cards(
         print("PIPELINE STAGE 2: EXTRACT")
         print(f"{'='*80}")
         print(f"Extracting structured cards from {len(candidates)} articles...")
-    
+
     cards = []
     for candidate in candidates:
         try:
             card = extract_article_card(
                 article_content=candidate.content,
                 article_id=candidate.article_id,
-                verbose=verbose
+                verbose=verbose,
+                filter_think=filter_think
             )
             cards.append(card)
         except Exception as e:
@@ -601,16 +616,18 @@ class ThreadSafeErrorCollector:
 def extract_single_card_worker(
     candidate: ArticleCandidate,
     retry_count: int,
-    verbose: bool
+    verbose: bool,
+    filter_think: bool = True
 ) -> ArticleCard:
     """
     Worker function for parallel card extraction.
-    
+
     Args:
         candidate: ArticleCandidate to extract
         retry_count: Number of retry attempts for failed extractions
         verbose: Enable progress logging
-        
+        filter_think: Whether to filter out think tags from LLM responses
+
     Returns:
         ArticleCard object
     """
@@ -619,7 +636,8 @@ def extract_single_card_worker(
             article_content=candidate.content,
             article_id=candidate.article_id,
             verbose=False,  # Reduce verbosity in workers
-            retry_count=retry_count
+            retry_count=retry_count,
+            filter_think=filter_think
         )
         return card
     except Exception as e:
@@ -630,17 +648,19 @@ def extract_all_article_cards_parallel(
     candidates: List[ArticleCandidate],
     max_concurrent: int = 5,
     verbose: bool = False,
-    retry_count: int = 3
+    retry_count: int = 3,
+    filter_think: bool = True
 ) -> List[ArticleCard]:
     """
     Extract article cards from all candidates in parallel using ThreadPoolExecutor.
-    
+
     Args:
         candidates: List of generated article candidates
         max_concurrent: Maximum concurrent LLM requests
         verbose: Enable progress logging
         retry_count: Number of retry attempts for failed extractions
-        
+        filter_think: Whether to filter out think tags from LLM responses
+
     Returns:
         List of ArticleCard objects
     """
@@ -649,10 +669,10 @@ def extract_all_article_cards_parallel(
         print("PARALLEL EXTRACTION STAGE")
         print(f"{'='*80}")
         print(f"Extracting {len(candidates)} cards with max {max_concurrent} concurrent requests...")
-    
+
     progress_tracker = ThreadSafeProgressTracker(len(candidates), "EXTRACT", verbose)
     error_collector = ThreadSafeErrorCollector()
-    
+
     def worker_extract_card(candidate: ArticleCandidate) -> ArticleCard:
         """Worker function for parallel extraction."""
         try:
@@ -660,7 +680,8 @@ def extract_all_article_cards_parallel(
                 article_content=candidate.content,
                 article_id=candidate.article_id,
                 verbose=False,  # Reduce verbosity in workers
-                retry_count=retry_count
+                retry_count=retry_count,
+                filter_think=filter_think
             )
             progress_tracker.update_progress(candidate.article_id, "extracted")
             return card
@@ -709,16 +730,18 @@ def extract_all_article_cards_parallel(
 def score_article_card(
     card: ArticleCard,
     criteria: Dict[str, Dict[str, Any]],
-    verbose: bool = False
+    verbose: bool = False,
+    filter_think: bool = True
 ) -> ArticleScore:
     """
     Score a single article card on all criteria.
-    
+
     Args:
         card: ArticleCard to evaluate
         criteria: Scoring criteria dictionary
         verbose: Enable progress logging
-        
+        filter_think: Whether to filter out think tags from LLM responses
+
     Returns:
         ArticleScore with scores and justifications
     """
@@ -736,19 +759,24 @@ Respond with only the JSON object containing scores and justifications."""
 
     # Prepare input text for metrics tracking
     input_text = score_system_prompt + "\n\n" + score_user_prompt
-    
+
     # Send to LLM with timing
     llm_start_time = time.time()
     response = send_to_llm(
         llm_user_prompt=score_user_prompt,
         llm_system_prompt=score_system_prompt,
-        temperature=0.2,  # Low temp for consistent evaluation
+        temperature=0.1,  # Zero temp for maximum consistency
         max_tokens=4000,
-        verbose=verbose
+        verbose=verbose,
+        seed=42  # Fixed seed for reproducible scoring
     )
     llm_end_time = time.time()
     execution_time = llm_end_time - llm_start_time
-    
+
+    # Filter out think tags if requested
+    if filter_think:
+        response = filter_think_tags(response)
+
     # Extract JSON from response (handles markdown code blocks and think tags)
     json_str = extract_json_from_response(response)
     
@@ -770,47 +798,63 @@ Respond with only the JSON object containing scores and justifications."""
     return ArticleScore(**score_data)
 
 
-def average_score_votes(votes: List[ArticleScore]) -> ArticleScore:
+def average_score_votes(votes: List[ArticleScore], verbose: bool = False) -> ArticleScore:
     """
     Average multiple scoring votes for the same article.
-    
+
     Args:
         votes: List of ArticleScore objects from multiple votes
-        
+        verbose: If True, print warnings for high-variance criteria
+
     Returns:
         Averaged ArticleScore
     """
     if not votes:
         raise ValueError("No votes to average")
-    
+
     # Use first vote as template
     averaged = votes[0]
-    
+
+    # Track variance warnings
+    high_variance_criteria = []
+
     # Average numeric scores for each criterion
     for criterion_name in averaged.scores.keys():
-        scores_sum = sum(
+        criterion_scores = [
             vote.scores[criterion_name]["score"]
             for vote in votes
             if criterion_name in vote.scores
-        )
+        ]
+        scores_sum = sum(criterion_scores)
         averaged.scores[criterion_name]["score"] = round(scores_sum / len(votes), 1)
-        # Keep first justification (they should be similar)
-    
+
+        # Calculate standard deviation to detect high variance
+        if len(criterion_scores) > 1:
+            std_dev = statistics.stdev(criterion_scores)
+            if std_dev > 1.5:
+                high_variance_criteria.append((criterion_name, std_dev, criterion_scores))
+
+    # Report high variance criteria
+    if verbose and high_variance_criteria:
+        print(f"    WARNING: High scoring variance detected for Article #{averaged.article_id}:")
+        for criterion, std_dev, scores in high_variance_criteria:
+            print(f"      - {criterion}: std_dev={std_dev:.2f}, votes={scores}")
+
     # Average overall score
     averaged.overall_score = round(
         sum(vote.overall_score for vote in votes) / len(votes), 2
     )
-    
+
     # Merge strengths and weaknesses (unique items only)
     all_strengths = set()
     all_weaknesses = set()
     for vote in votes:
         all_strengths.update(vote.standout_strengths)
         all_weaknesses.update(vote.critical_weaknesses)
-    
+
     averaged.standout_strengths = list(all_strengths)
     averaged.critical_weaknesses = list(all_weaknesses)
-    
+
     return averaged
 
 
@@ -818,17 +862,19 @@ def score_all_cards_with_voting(
     cards: List[ArticleCard],
     criteria: Dict[str, Dict[str, Any]] = SCORING_CRITERIA,
     votes: int = 3,
-    verbose: bool = False
+    verbose: bool = False,
+    filter_think: bool = True
 ) -> List[ArticleScore]:
     """
     Score all cards with voting to reduce variance.
-    
+
     Args:
         cards: List of ArticleCards to score
         criteria: Scoring criteria dictionary
         votes: Number of voting rounds per card (default: 3)
         verbose: Enable progress logging
-        
+        filter_think: Whether to filter out think tags from LLM responses
+
     Returns:
         List of averaged ArticleScore objects
     """
@@ -837,18 +883,18 @@ def score_all_cards_with_voting(
         print("PIPELINE STAGE 3: SCORE")
         print(f"{'='*80}")
         print(f"Scoring {len(cards)} cards with {votes} votes each...")
-    
+
     all_scores = []
-    
+
     for card in cards:
         if verbose:
             print(f"  Scoring Article #{card.article_id}...")
-        
+
         # Collect multiple votes
         card_votes = []
         for vote_num in range(votes):
             try:
-                score = score_article_card(card, criteria, verbose=False)
+                score = score_article_card(card, criteria, verbose=False, filter_think=filter_think)
                 card_votes.append(score)
                 if verbose:
                     print(f"    Vote {vote_num + 1}/{votes}: Overall score = {score.overall_score}")
@@ -858,7 +904,7 @@ def score_all_cards_with_voting(
         
         # Average the votes
         if card_votes:
-            averaged_score = average_score_votes(card_votes)
+            averaged_score = average_score_votes(card_votes, verbose=verbose)
             all_scores.append(averaged_score)
             if verbose:
                 print(f"  ✓ Average score: {averaged_score.overall_score}\n")
@@ -894,22 +940,24 @@ def score_single_vote_worker(
     card: ArticleCard,
     criteria: Dict[str, Dict[str, Any]],
     vote_number: int,
-    verbose: bool
+    verbose: bool,
+    filter_think: bool = True
 ) -> ArticleScore:
     """
     Worker function for parallel single vote scoring.
-    
+
     Args:
         card: ArticleCard to score
         criteria: Scoring criteria dictionary
         vote_number: Vote number (1-indexed)
         verbose: Enable progress logging
-        
+        filter_think: Whether to filter out think tags from LLM responses
+
     Returns:
         ArticleScore object
     """
     try:
-        score = score_article_card(card, criteria, verbose=False)
+        score = score_article_card(card, criteria, verbose=False, filter_think=filter_think)
         return score
     except Exception as e:
         raise RuntimeError(f"Failed to score vote {vote_number} for card {card.article_id}: {e}")
@@ -920,18 +968,20 @@ def score_all_cards_with_voting_parallel(
     max_concurrent: int = 5,
     votes: int = 3,
     criteria: Dict[str, Dict[str, Any]] = SCORING_CRITERIA,
-    verbose: bool = False
+    verbose: bool = False,
+    filter_think: bool = True
 ) -> List[ArticleScore]:
     """
     Score all cards with voting in parallel using ThreadPoolExecutor.
-    
+
     Args:
         cards: List of ArticleCards to score
         max_concurrent: Maximum concurrent LLM requests
         votes: Number of voting rounds per card
         criteria: Scoring criteria dictionary
         verbose: Enable progress logging
-        
+        filter_think: Whether to filter out think tags from LLM responses
+
     Returns:
         List of averaged ArticleScore objects
     """
@@ -940,22 +990,22 @@ def score_all_cards_with_voting_parallel(
         print("PARALLEL SCORING STAGE")
         print(f"{'='*80}")
         print(f"Scoring {len(cards)} cards with {votes} votes each, max {max_concurrent} concurrent...")
-    
+
     total_scoring_operations = len(cards) * votes
     progress_tracker = ThreadSafeProgressTracker(total_scoring_operations, "SCORE", verbose)
     error_collector = ThreadSafeErrorCollector()
-    
+
     def worker_score_single_vote(card: ArticleCard, vote_number: int) -> ArticleScore:
         """Worker function for single vote scoring."""
         try:
-            score = score_article_card(card, criteria, verbose=False)
+            score = score_article_card(card, criteria, verbose=False, filter_think=filter_think)
             progress_tracker.update_progress(f"{card.article_id}-{vote_number}", f"vote{vote_number}_completed")
             return score
         except Exception as e:
             error_collector.add_error(f"{card.article_id}-{vote_number}", e)
             progress_tracker.update_progress(f"{card.article_id}-{vote_number}", f"vote{vote_number}_failed: {e}")
             raise
-    
+
     def worker_score_all_votes_for_card(card: ArticleCard) -> ArticleScore:
         """Worker function to score one card with all votes."""
         card_votes = []
@@ -968,7 +1018,7 @@ def score_all_cards_with_voting_parallel(
                     print(f"    ⚠ Vote {vote_num + 1} failed for card {card.article_id}: {e}")
         
         if card_votes:
-            return average_score_votes(card_votes)
+            return average_score_votes(card_votes, verbose=verbose)
         else:
             raise RuntimeError(f"All votes failed for card {card.article_id}")
     
@@ -1013,16 +1063,18 @@ def score_all_cards_with_voting_parallel(
 def select_best_elements(
     cards: List[ArticleCard],
     scores: List[ArticleScore],
-    verbose: bool = False
+    verbose: bool = False,
+    filter_think: bool = True
 ) -> SynthesisBlueprint:
     """
     Analyze all cards and scores to select best elements for synthesis.
-    
+
     Args:
         cards: List of ArticleCards
         scores: List of corresponding ArticleScore objects
         verbose: Enable progress logging
-        
+        filter_think: Whether to filter out think tags from LLM responses
+
     Returns:
         SynthesisBlueprint specifying how to combine elements
     """
@@ -1031,7 +1083,7 @@ def select_best_elements(
         print("PIPELINE STAGE 4: SELECT")
         print(f"{'='*80}")
         print(f"Analyzing {len(cards)} articles to select best elements...")
-    
+
     # Build analysis input (compressed view)
     analysis_input = []
     for card, score in zip(cards, scores):
@@ -1046,7 +1098,7 @@ def select_best_elements(
             "scores": {k: v["score"] for k, v in score.scores.items()},
             "overall_score": score.overall_score
         })
-    
+
     select_system_prompt = read_reference_file("prompts/pipeline_stage4_select_system.md")
 
     select_user_prompt = f"""Analyze these {len(cards)} article drafts and create a synthesis blueprint.
@@ -1060,7 +1112,7 @@ Respond with only the JSON object."""
 
     # Prepare input text for metrics tracking
     input_text = select_system_prompt + "\n\n" + select_user_prompt
-    
+
     # Send to LLM with timing
     llm_start_time = time.time()
     response = send_to_llm(
@@ -1072,9 +1124,10 @@ Respond with only the JSON object."""
     )
     llm_end_time = time.time()
     execution_time = llm_end_time - llm_start_time
-    
-    # Filter out think tags from reasoning model output
-    response = filter_think_tags(response)
+
+    # Filter out think tags if requested
+    if filter_think:
+        response = filter_think_tags(response)
 
     # Extract JSON from response (handles markdown code blocks and think tags)
     json_str = extract_json_from_response(response)
@@ -1117,18 +1170,20 @@ def synthesize_final_article(
     original_user_prompt: str,
     brand_guidelines: str,
     target_word_count: int = 1500,
-    verbose: bool = False
+    verbose: bool = False,
+    filter_think: bool = True
 ) -> str:
     """
     Generate final article from synthesis blueprint.
-    
+
     Args:
         blueprint: SynthesisBlueprint with specifications
         original_user_prompt: The original topic/brief
         brand_guidelines: Company brand guidelines (from existing system prompt)
         target_word_count: Desired article length
         verbose: Enable progress logging
-        
+        filter_think: Whether to filter out think tags from LLM responses
+
     Returns:
         Final synthesized article text
     """
@@ -1137,7 +1192,7 @@ def synthesize_final_article(
         print("PIPELINE STAGE 5: SYNTHESIZE")
         print(f"{'='*80}")
         print(f"Generating final article from blueprint...")
-    
+
     # Load prompt template and substitute variables
     prompt_template = read_reference_file("prompts/pipeline_stage5_synthesize_system.md")
     writing_style_content = read_reference_file("reference_context/writing_style-enhanced.md")
@@ -1159,7 +1214,7 @@ Write the complete article now. Start directly with the headline."""
 
     # Prepare input text for metrics tracking
     input_text = synthesize_system_prompt + "\n\n" + synthesize_user_prompt
-    
+
     # Send to LLM with timing
     llm_start_time = time.time()
     article = send_to_llm(
@@ -1171,9 +1226,10 @@ Write the complete article now. Start directly with the headline."""
     )
     llm_end_time = time.time()
     execution_time = llm_end_time - llm_start_time
-    
-    # Filter out think tags from reasoning model output
-    article = filter_think_tags(article)
+
+    # Filter out think tags if requested
+    if filter_think:
+        article = filter_think_tags(article)
     
     # Track LLM call metrics
     track_llm_call("SYNTHESIZE", input_text, article, execution_time)
@@ -1196,11 +1252,12 @@ def validate_synthesized_article(
     original_scores: List[ArticleScore],
     verbose: bool = False,
     validation_retry_count: int = 3,
-    validation_retry_delay: float = 2.0
+    validation_retry_delay: float = 2.0,
+    filter_think: bool = True
 ) -> ValidationResult:
     """
     Validate that synthesized article meets quality standards with retry loop.
-    
+
     Args:
         article: Synthesized article text
         blueprint: SynthesisBlueprint it should follow
@@ -1208,7 +1265,8 @@ def validate_synthesized_article(
         verbose: Enable progress logging
         validation_retry_count: Number of validation retry attempts (default: 3)
         validation_retry_delay: Delay between validation retries in seconds (default: 2.0)
-        
+        filter_think: Whether to filter out think tags from LLM responses
+
     Returns:
         ValidationResult with pass/fail and detailed feedback
     """
@@ -1217,11 +1275,11 @@ def validate_synthesized_article(
         print("PIPELINE STAGE 6: VALIDATE")
         print(f"{'='*80}")
         print("Validating synthesized article...")
-    
+
     # Calculate target threshold (should beat average of sources)
     avg_source_score = sum(s.overall_score for s in original_scores) / len(original_scores)
     target_threshold = avg_source_score + 0.5
-    
+
     validate_system_prompt = f"""You are a content quality assurance agent. You will receive:
 1. A synthesized article
 2. The blueprint it was supposed to follow
@@ -1326,7 +1384,11 @@ Evaluate and respond with the validation JSON."""
             )
             llm_end_time = time.time()
             execution_time = llm_end_time - llm_start_time
-            
+
+            # Filter out think tags if requested
+            if filter_think:
+                response = filter_think_tags(response)
+
             # Extract JSON from response (handles markdown code blocks and think tags)
             json_str = extract_json_from_response(response)
             
@@ -1374,11 +1436,12 @@ def synthesize_with_validation_loop(
     original_scores: List[ArticleScore],
     target_word_count: int = 1500,
     max_retries: int = 3,
-    verbose: bool = False
+    verbose: bool = False,
+    filter_think: bool = True
 ) -> tuple[str, ValidationResult | None]:
     """
     Synthesize article with validation retry loop.
-    
+
     Args:
         blueprint: SynthesisBlueprint
         original_user_prompt: Original topic/brief
@@ -1387,26 +1450,28 @@ def synthesize_with_validation_loop(
         target_word_count: Desired article length
         max_retries: Maximum synthesis attempts
         verbose: Enable progress logging
-        
+        filter_think: Whether to filter out think tags from LLM responses
+
     Returns:
         Tuple of (final_article, validation_result)
     """
     article = ""
     validation = None
-    
+
     for attempt in range(1, max_retries + 1):
         if verbose and attempt > 1:
             print(f"  Retry attempt {attempt}/{max_retries}...")
-        
+
         # Generate article
         article = synthesize_final_article(
             blueprint=blueprint,
             original_user_prompt=original_user_prompt,
             brand_guidelines=brand_guidelines,
             target_word_count=target_word_count,
-            verbose=verbose
+            verbose=verbose,
+            filter_think=filter_think
         )
-        
+
         # Validate
         validation = validate_synthesized_article(
             article=article,
@@ -1414,7 +1479,8 @@ def synthesize_with_validation_loop(
             original_scores=original_scores,
             verbose=verbose,
             validation_retry_count=3,
-            validation_retry_delay=2.0
+            validation_retry_delay=2.0,
+            filter_think=filter_think
         )
         
         if validation.passed:
@@ -1437,11 +1503,12 @@ def synthesize_with_validation_loop(
 
 class ArticleSynthesisPipeline:
     """Orchestrates the complete 5-stage synthesis pipeline."""
-    
-    def __init__(self, verbose: bool = False):
+
+    def __init__(self, verbose: bool = False, filter_think: bool = True):
         self.verbose = verbose
+        self.filter_think = filter_think
         self.artifacts = {}  # Store intermediate results
-    
+
     def run(
         self,
         candidates: List[ArticleCandidate],
@@ -1455,7 +1522,7 @@ class ArticleSynthesisPipeline:
     ) -> Dict:
         """
         Execute complete pipeline.
-        
+
         Args:
             candidates: List of generated article candidates
             original_user_prompt: Original topic/brief
@@ -1465,7 +1532,7 @@ class ArticleSynthesisPipeline:
             max_synthesis_retries: Max synthesis attempts on validation failure
             parallel_processing: Enable parallel processing for extraction stage
             max_concurrent: Maximum concurrent requests for extraction stage
-            
+
         Returns:
             Dict with final_article, validation, and all intermediate artifacts
         """
@@ -1475,30 +1542,33 @@ class ArticleSynthesisPipeline:
                 cards = extract_all_article_cards_parallel(
                     candidates=candidates,
                     max_concurrent=max_concurrent,
-                    verbose=self.verbose
+                    verbose=self.verbose,
+                    filter_think=self.filter_think
                 )
             else:
-                cards = extract_all_article_cards(candidates, self.verbose)
+                cards = extract_all_article_cards(candidates, self.verbose, self.filter_think)
             self.artifacts['cards'] = cards
-            
+
             # STAGE 3: SCORE (with optional parallel processing)
             if parallel_processing:
                 scores = score_all_cards_with_voting_parallel(
                     cards=cards,
                     max_concurrent=max_concurrent,
                     votes=scoring_votes,
-                    verbose=self.verbose
+                    verbose=self.verbose,
+                    filter_think=self.filter_think
                 )
             else:
                 scores = score_all_cards_with_voting(
                     cards,
                     votes=scoring_votes,
-                    verbose=self.verbose
+                    verbose=self.verbose,
+                    filter_think=self.filter_think
                 )
             self.artifacts['scores'] = scores
-            
+
             # STAGE 4: SELECT
-            blueprint = select_best_elements(cards, scores, self.verbose)
+            blueprint = select_best_elements(cards, scores, self.verbose, self.filter_think)
             self.artifacts['blueprint'] = blueprint
 
             # STAGE 5 & 6: SYNTHESIZE + VALIDATE (with retry loop)
@@ -1510,7 +1580,8 @@ class ArticleSynthesisPipeline:
                 original_scores=scores,
                 target_word_count=target_word_count,
                 max_retries=max_synthesis_retries,
-                verbose=self.verbose
+                verbose=self.verbose,
+                filter_think=self.filter_think
             )
             
             return {
@@ -2036,7 +2107,12 @@ When writing marketing content, always:
 5. Focus on the benefits of user-generated 3D data and community collaboration
 6. Avoid corporate jargon and speak directly to both professionals and hobbyists"""
 
-        generation_user_prompt = read_reference_file(args.topic_file)
+        # Only read topic file if provided (not needed when loading candidates from disk)
+        if args.topic_file:
+            generation_user_prompt = read_reference_file(args.topic_file)
+        else:
+            # Placeholder when loading candidates from disk - topic is embedded in candidate files
+            generation_user_prompt = "[Candidate files loaded from disk - topic embedded in source files]"
         
         if args.verbose:
             print("Built system and user prompts from reference context files")
@@ -2140,8 +2216,8 @@ When writing marketing content, always:
         
         # Run synthesis pipeline unless --candidates-only is set
         if not args.candidates_only:
-            pipeline = ArticleSynthesisPipeline(verbose=args.verbose)
-            
+            pipeline = ArticleSynthesisPipeline(verbose=args.verbose, filter_think=args.filter_think)
+
             result = pipeline.run(
                 candidates=candidates,
                 original_user_prompt=generation_user_prompt,
