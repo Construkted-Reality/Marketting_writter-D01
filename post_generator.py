@@ -1331,6 +1331,12 @@ Evaluate and respond with the validation JSON."""
             json_str = extract_json_from_response(response)
             
             validation_data = json.loads(json_str)
+            
+            # Handle field name mismatch between LLM output and dataclass
+            # LLM may return 'quality_score' but dataclass expects 'quality_scores'
+            if 'quality_score' in validation_data and 'quality_scores' not in validation_data:
+                validation_data['quality_scores'] = validation_data.pop('quality_score')
+            
             result = ValidationResult(**validation_data)
             
             # Track LLM call metrics
@@ -1807,6 +1813,78 @@ def generate_candidates_parallel(
     return candidates
 
 
+# ============================================================================
+# CANDIDATE FILE LOADING
+# ============================================================================
+
+def load_candidate_files(
+    candidates_dir: str,
+    verbose: bool = False
+) -> List[ArticleCandidate]:
+    """
+    Load pre-generated candidate articles from markdown files in a folder.
+    
+    Args:
+        candidates_dir: Path to folder containing candidate markdown files
+        verbose: Enable progress logging
+        
+    Returns:
+        List of ArticleCandidate objects
+    """
+    if verbose:
+        print(f"\n{'='*80}")
+        print("LOADING CANDIDATES FROM DISK")
+        print(f"{'='*80}")
+        print(f"Loading candidates from: {candidates_dir}")
+    
+    candidates = []
+    candidates_path = Path(candidates_dir)
+    
+    if not candidates_path.exists():
+        raise FileNotFoundError(f"Candidates directory not found: {candidates_dir}")
+    
+    if not candidates_path.is_dir():
+        raise ValueError(f"Path is not a directory: {candidates_dir}")
+    
+    # Find all markdown files in the directory
+    md_files = sorted(candidates_path.glob("*.md"))
+    
+    if not md_files:
+        raise ValueError(f"No markdown files found in: {candidates_dir}")
+    
+    for idx, md_file in enumerate(md_files, start=1):
+        try:
+            content = md_file.read_text(encoding="utf-8")
+            
+            # Extract word count from content if present (format: "**Word Count: N**")
+            word_count_match = re.search(r'\*\*Word Count:\s*(\d+)\*\*', content)
+            word_count = int(word_count_match.group(1)) if word_count_match else len(content.split())
+            
+            # Clean up the word count footer if present
+            clean_content = re.sub(r'\n\n---\n\*\*Word Count:\s*\d+\*\*', '', content)
+            
+            candidate = ArticleCandidate(
+                article_id=idx,
+                content=clean_content.strip(),
+                word_count=word_count,
+                generation_timestamp=time.time()
+            )
+            candidates.append(candidate)
+            
+            if verbose:
+                print(f"  Loaded: {md_file.name} ({word_count} words)")
+                
+        except Exception as e:
+            if verbose:
+                print(f"  ✗ Failed to load {md_file.name}: {e}")
+            raise
+    
+    if verbose:
+        print(f"✓ Loaded {len(candidates)} candidates from disk\n")
+    
+    return candidates
+
+
 def main():
     """Main function with integrated synthesis pipeline."""
     parser = argparse.ArgumentParser(
@@ -1863,12 +1941,18 @@ def main():
         help="Path to file containing the specific blog post topic/idea"
     )
     
-    # New synthesis pipeline arguments
+    # Pipeline mode argument (mutually exclusive)
     parser.add_argument(
-        "--enable-synthesis",
+        "--candidates-only",
         action="store_true",
-        help="Enable 5-stage synthesis pipeline (requires --iterations >= 10)"
+        help="Generate candidate articles only, skip synthesis pipeline"
     )
+    parser.add_argument(
+        "--candidates-dir",
+        help="Path to folder containing candidate markdown files. Skips candidate generation and loads from files."
+    )
+    
+    # Synthesis pipeline arguments
     parser.add_argument(
         "--synthesis-votes",
         type=int,
@@ -1906,11 +1990,6 @@ def main():
     )
     
     args = parser.parse_args()
-    
-    # Validation for synthesis pipeline
-    if args.enable_synthesis and args.iterations < 10:
-        print("Warning: Synthesis pipeline recommended with --iterations >= 10")
-        print("Proceeding anyway...")
     
     # Handle cleanup if requested
     if args.cleanup_old > 0:
@@ -1963,95 +2042,104 @@ When writing marketing content, always:
             print("Built system and user prompts from reference context files")
         
         # ====================================================================
-        # STAGE 1: Generation of candidate articles
+        # STAGE 1: Generation or Loading of candidate articles
         # ====================================================================
         
         stage_start_time = time.time()
         
-        # Choose parallel or sequential generation
-        if args.parallel:
-            # Parallel generation using ThreadPoolExecutor
-            candidates = generate_candidates_parallel(
-                iterations=args.iterations,
-                generation_system_prompt=generation_system_prompt,
-                generation_user_prompt=generation_user_prompt,
-                temperature=args.temperature,
-                max_tokens=args.max_tokens,
-                retry_count=args.retry_count,
-                retry_delay=args.retry_delay,
-                filter_think=args.filter_think,
-                output_base=args.output,
-                max_concurrent=args.max_concurrent,
-                verbose=args.verbose
-            )
+        # Check for --candidates-dir mode first
+        if args.candidates_dir:
+            # Mode 2: Load candidates from disk and run synthesis pipeline
+            if args.verbose:
+                print(f"Loading candidates from directory: {args.candidates_dir}")
+            candidates = load_candidate_files(args.candidates_dir, verbose=args.verbose)
         else:
-            # Sequential generation (original implementation)
-            candidates = []
-            
-            for iteration in range(1, args.iterations + 1):
-                if args.verbose:
-                    print(f"\nGenerating candidate {iteration}/{args.iterations}...")
-                
-                # Prepare input text for metrics tracking
-                input_text = generation_system_prompt + "\n\n" + generation_user_prompt
-                
-                # Send to LLM with timing
-                llm_start_time = time.time()
-                response = send_to_llm(
-                    llm_user_prompt=generation_user_prompt,
-                    llm_system_prompt=generation_system_prompt,
+            # Mode 1 or 3: Generate candidates (default or --candidates-only)
+            # Choose parallel or sequential generation
+            if args.parallel:
+                # Parallel generation using ThreadPoolExecutor
+                candidates = generate_candidates_parallel(
+                    iterations=args.iterations,
+                    generation_system_prompt=generation_system_prompt,
+                    generation_user_prompt=generation_user_prompt,
                     temperature=args.temperature,
                     max_tokens=args.max_tokens,
                     retry_count=args.retry_count,
                     retry_delay=args.retry_delay,
+                    filter_think=args.filter_think,
+                    output_base=args.output,
+                    max_concurrent=args.max_concurrent,
                     verbose=args.verbose
                 )
-                llm_end_time = time.time()
-                execution_time = llm_end_time - llm_start_time
+            else:
+                # Sequential generation (original implementation)
+                candidates = []
                 
-                # Apply think tag filtering if requested
-                if args.filter_think:
+                for iteration in range(1, args.iterations + 1):
                     if args.verbose:
-                        print("Filtering out content between <think> tags...")
-                    response = filter_think_tags(response)
-                
-                # Track LLM call metrics
-                track_llm_call("CANDIDATES", input_text, response, execution_time)
-                
-                # Store candidate in memory
-                candidate = ArticleCandidate(
-                    article_id=iteration,
-                    content=response,
-                    word_count=len(response.split()),
-                    generation_timestamp=time.time()
-                )
-                candidates.append(candidate)
-                
-                # Save individual candidate files to organized structure
-                if args.output:
-                    output_dir = create_output_directory(args.output)
+                        print(f"\nGenerating candidate {iteration}/{args.iterations}...")
                     
-                    if args.iterations == 1:
-                        filename = output_dir / f"{args.output}.md"
-                    else:
-                        filename = output_dir / "candidates" / f"{args.output}_candidate_{iteration:02d}.md"
+                    # Prepare input text for metrics tracking
+                    input_text = generation_system_prompt + "\n\n" + generation_user_prompt
                     
-                    filename.write_text(
-                        response + f"\n\n---\n**Word Count: {candidate.word_count}**",
-                        encoding='utf-8'
+                    # Send to LLM with timing
+                    llm_start_time = time.time()
+                    response = send_to_llm(
+                        llm_user_prompt=generation_user_prompt,
+                        llm_system_prompt=generation_system_prompt,
+                        temperature=args.temperature,
+                        max_tokens=args.max_tokens,
+                        retry_count=args.retry_count,
+                        retry_delay=args.retry_delay,
+                        verbose=args.verbose
                     )
-                    if args.verbose:
-                        print(f"Candidate saved: {filename}")
-        
-        # Add total execution time for candidates stage
-        stage_end_time = time.time()
-        pipeline_metrics.candidates_stage.add_execution_time(stage_end_time - stage_start_time)
+                    llm_end_time = time.time()
+                    execution_time = llm_end_time - llm_start_time
+                    
+                    # Apply think tag filtering if requested
+                    if args.filter_think:
+                        if args.verbose:
+                            print("Filtering out content between <think> tags...")
+                        response = filter_think_tags(response)
+                    
+                    # Track LLM call metrics
+                    track_llm_call("CANDIDATES", input_text, response, execution_time)
+                    
+                    # Store candidate in memory
+                    candidate = ArticleCandidate(
+                        article_id=iteration,
+                        content=response,
+                        word_count=len(response.split()),
+                        generation_timestamp=time.time()
+                    )
+                    candidates.append(candidate)
+                    
+                    # Save individual candidate files to organized structure
+                    if args.output:
+                        output_dir = create_output_directory(args.output)
+                        
+                        if args.iterations == 1:
+                            filename = output_dir / f"{args.output}.md"
+                        else:
+                            filename = output_dir / "candidates" / f"{args.output}_candidate_{iteration:02d}.md"
+                        
+                        filename.write_text(
+                            response + f"\n\n---\n**Word Count: {candidate.word_count}**",
+                            encoding='utf-8'
+                        )
+                        if args.verbose:
+                            print(f"Candidate saved: {filename}")
+            
+            # Add total execution time for candidates stage (only if we actually generated)
+            stage_end_time = time.time()
+            pipeline_metrics.candidates_stage.add_execution_time(stage_end_time - stage_start_time)
         
         # ====================================================================
-        # STAGES 2-6: SYNTHESIS PIPELINE
+        # STAGES 2-6: SYNTHESIS PIPELINE (or skip if --candidates-only)
         # ====================================================================
         
-        if args.enable_synthesis:
+        # Run synthesis pipeline unless --candidates-only is set
+        if not args.candidates_only:
             pipeline = ArticleSynthesisPipeline(verbose=args.verbose)
             
             result = pipeline.run(
@@ -2080,6 +2168,12 @@ When writing marketing content, always:
             print(f"Source articles: {result['num_source_articles']}")
             print(f"Validation passed: {result['validation'].passed}")
             print(f"Final article quality score: {result['validation'].quality_scores['overall']:.1f}/10")
+            print(f"{'='*80}\n")
+        else:
+            print(f"\n{'='*80}")
+            print("CANDIDATES GENERATION COMPLETE (--candidates-only)")
+            print(f"{'='*80}")
+            print(f"Generated {len(candidates)} candidates. Skipping synthesis pipeline.")
             print(f"{'='*80}\n")
         
         # Track total execution time
