@@ -765,7 +765,7 @@ Respond with only the JSON object containing scores and justifications."""
     response = send_to_llm(
         llm_user_prompt=score_user_prompt,
         llm_system_prompt=score_system_prompt,
-        temperature=0.1,  # Zero temp for maximum consistency
+        temperature=0.0,  # Zero temp for maximum consistency
         max_tokens=4000,
         verbose=verbose,
         seed=42  # Fixed seed for reproducible scoring
@@ -798,16 +798,20 @@ Respond with only the JSON object containing scores and justifications."""
     return ArticleScore(**score_data)
 
 
-def average_score_votes(votes: List[ArticleScore], verbose: bool = False) -> ArticleScore:
+def average_score_votes(votes: List[ArticleScore], verbose: bool = False, use_outlier_detection: bool = True) -> ArticleScore:
     """
-    Average multiple scoring votes for the same article.
+    Average multiple scoring votes for the same article with outlier detection.
+
+    Uses median-based outlier detection to discard votes that deviate significantly
+    from the consensus, improving score stability.
 
     Args:
         votes: List of ArticleScore objects from multiple votes
         verbose: If True, print warnings for high-variance criteria
+        use_outlier_detection: If True, discard outliers >2 std from median before averaging
 
     Returns:
-        Averaged ArticleScore
+        Averaged ArticleScore with improved stability
     """
     if not votes:
         raise ValueError("No votes to average")
@@ -815,24 +819,60 @@ def average_score_votes(votes: List[ArticleScore], verbose: bool = False) -> Art
     # Use first vote as template
     averaged = votes[0]
 
-    # Track variance warnings
+    # Track variance warnings and outlier removals
     high_variance_criteria = []
+    outliers_removed = []
 
-    # Average numeric scores for each criterion
+    # Average numeric scores for each criterion with outlier detection
     for criterion_name in averaged.scores.keys():
         criterion_scores = [
             vote.scores[criterion_name]["score"]
             for vote in votes
             if criterion_name in vote.scores
         ]
-        scores_sum = sum(criterion_scores)
-        averaged.scores[criterion_name]["score"] = round(scores_sum / len(votes), 1)
 
-        # Calculate standard deviation to detect high variance
+        if len(criterion_scores) == 0:
+            continue
+
+        # Calculate median for robust central tendency
+        median_score = statistics.median(criterion_scores)
+
+        # Apply outlier detection if enabled and we have enough votes
+        filtered_scores = criterion_scores
+        if use_outlier_detection and len(criterion_scores) >= 3:
+            std_dev = statistics.stdev(criterion_scores)
+            if std_dev > 0:
+                # Remove scores that deviate >2 std from median
+                filtered_scores = [
+                    s for s in criterion_scores
+                    if abs(s - median_score) <= 2 * std_dev
+                ]
+                # Track if outliers were removed
+                if len(filtered_scores) < len(criterion_scores):
+                    removed = [s for s in criterion_scores if s not in filtered_scores]
+                    outliers_removed.append((criterion_name, removed, criterion_scores))
+                # Ensure we keep at least half the votes
+                if len(filtered_scores) < len(criterion_scores) // 2 + 1:
+                    filtered_scores = criterion_scores  # Revert if too many removed
+
+        # Calculate final score using mean of filtered scores
+        final_score = sum(filtered_scores) / len(filtered_scores)
+        averaged.scores[criterion_name]["score"] = round(final_score, 1)
+
+        # Store median for reference
+        averaged.scores[criterion_name]["median"] = round(median_score, 1)
+
+        # Calculate standard deviation to detect high variance (on original scores)
         if len(criterion_scores) > 1:
             std_dev = statistics.stdev(criterion_scores)
             if std_dev > 1.5:
                 high_variance_criteria.append((criterion_name, std_dev, criterion_scores))
+
+    # Report outlier removals
+    if verbose and outliers_removed:
+        print(f"    INFO: Outliers removed for Article #{averaged.article_id}:")
+        for criterion, removed, original in outliers_removed:
+            print(f"      - {criterion}: removed {removed} from {original}")
 
     # Report high variance criteria
     if verbose and high_variance_criteria:
@@ -840,10 +880,13 @@ def average_score_votes(votes: List[ArticleScore], verbose: bool = False) -> Art
         for criterion, std_dev, scores in high_variance_criteria:
             print(f"      - {criterion}: std_dev={std_dev:.2f}, votes={scores}")
 
-    # Average overall score
+    # Average overall score using median for robustness
+    overall_scores = [vote.overall_score for vote in votes]
     averaged.overall_score = round(
-        sum(vote.overall_score for vote in votes) / len(votes), 2
+        sum(overall_scores) / len(overall_scores), 2
     )
+    # Also store median overall score
+    averaged_median_overall = statistics.median(overall_scores)
 
     # Merge strengths and weaknesses (unique items only)
     all_strengths = set()
@@ -1052,6 +1095,395 @@ def score_all_cards_with_voting_parallel(
             print(f"  Failed scoring operations: {failed}")
         print()
     
+    return all_scores
+
+
+# ============================================================================
+# PAIRWISE SCORING MODE
+# Purpose: Compare articles head-to-head for more stable rankings
+# ============================================================================
+
+@dataclass
+class PairwiseResult:
+    """Result of a single pairwise comparison."""
+    article_a_id: int
+    article_b_id: int
+    criterion: str
+    winner: str  # "A", "B", or "TIE"
+    justification: str
+    confidence: str
+
+
+def pairwise_compare_articles(
+    card_a: ArticleCard,
+    card_b: ArticleCard,
+    criterion: str,
+    criterion_description: str,
+    verbose: bool = False,
+    filter_think: bool = True
+) -> PairwiseResult:
+    """
+    Compare two article cards on a specific criterion.
+
+    Args:
+        card_a: First ArticleCard
+        card_b: Second ArticleCard
+        criterion: Name of criterion to compare
+        criterion_description: Description of the criterion
+        verbose: Enable progress logging
+        filter_think: Whether to filter out think tags from LLM responses
+
+    Returns:
+        PairwiseResult with winner and justification
+    """
+    pairwise_system_prompt = read_reference_file("prompts/pipeline_stage3_pairwise_system.md")
+
+    # Build comparison prompt with relevant card excerpts
+    card_a_excerpt = {
+        "article_id": card_a.article_id,
+        "opening_hook": card_a.opening_hook,
+        "core_argument": card_a.core_argument,
+        "key_points": card_a.key_points,
+        "memorable_phrases": card_a.memorable_phrases,
+        "structural_approach": card_a.structural_approach,
+        "evidence_used": card_a.evidence_used,
+    }
+
+    card_b_excerpt = {
+        "article_id": card_b.article_id,
+        "opening_hook": card_b.opening_hook,
+        "core_argument": card_b.core_argument,
+        "key_points": card_b.key_points,
+        "memorable_phrases": card_b.memorable_phrases,
+        "structural_approach": card_b.structural_approach,
+        "evidence_used": card_b.evidence_used,
+    }
+
+    pairwise_user_prompt = f"""Compare these two articles on the criterion: {criterion}
+
+## Criterion Definition
+{criterion_description}
+
+## Article A (ID: {card_a.article_id})
+{json.dumps(card_a_excerpt, indent=2)}
+
+## Article B (ID: {card_b.article_id})
+{json.dumps(card_b_excerpt, indent=2)}
+
+Which article is better on {criterion}? Respond with only the JSON object."""
+
+    # Prepare input text for metrics tracking
+    input_text = pairwise_system_prompt + "\n\n" + pairwise_user_prompt
+
+    # Send to LLM with timing
+    llm_start_time = time.time()
+    response = send_to_llm(
+        llm_user_prompt=pairwise_user_prompt,
+        llm_system_prompt=pairwise_system_prompt,
+        temperature=0.0,  # Zero temp for maximum consistency
+        max_tokens=500,
+        verbose=verbose,
+        seed=42  # Fixed seed for reproducibility
+    )
+    llm_end_time = time.time()
+    execution_time = llm_end_time - llm_start_time
+
+    # Filter out think tags if requested
+    if filter_think:
+        response = filter_think_tags(response)
+
+    # Extract JSON from response
+    json_str = extract_json_from_response(response)
+    result_data = json.loads(json_str)
+
+    # Track LLM call metrics
+    track_llm_call("SCORE", input_text, json_str, execution_time)
+
+    return PairwiseResult(
+        article_a_id=card_a.article_id,
+        article_b_id=card_b.article_id,
+        criterion=criterion,
+        winner=result_data.get("winner", "TIE"),
+        justification=result_data.get("justification", ""),
+        confidence=result_data.get("confidence", "medium")
+    )
+
+
+def wins_to_score(wins: float, max_possible_wins: int) -> float:
+    """
+    Convert win count to 1-10 scale.
+
+    Args:
+        wins: Number of wins (can be fractional due to ties)
+        max_possible_wins: Maximum possible wins (n-1 for n articles)
+
+    Returns:
+        Score on 1-10 scale
+    """
+    if max_possible_wins == 0:
+        return 5.5  # Default middle score if only one article
+    # 0 wins = 1, all wins = 10
+    return 1 + (wins / max_possible_wins) * 9
+
+
+def score_all_cards_pairwise(
+    cards: List[ArticleCard],
+    criteria: Dict[str, Dict[str, Any]] = SCORING_CRITERIA,
+    verbose: bool = False,
+    filter_think: bool = True
+) -> List[ArticleScore]:
+    """
+    Score all cards using pairwise comparison for more stable rankings.
+
+    For each criterion, compares all pairs of articles and counts wins.
+    Converts win counts to 1-10 scores for compatibility with existing pipeline.
+
+    Args:
+        cards: List of ArticleCards to score
+        criteria: Scoring criteria dictionary
+        verbose: Enable progress logging
+        filter_think: Whether to filter out think tags from LLM responses
+
+    Returns:
+        List of ArticleScore objects with scores derived from pairwise rankings
+    """
+    if verbose:
+        print(f"\n{'='*80}")
+        print("PAIRWISE SCORING MODE")
+        print(f"{'='*80}")
+        n_cards = len(cards)
+        n_pairs = n_cards * (n_cards - 1) // 2
+        n_criteria = len(criteria)
+        print(f"Comparing {n_cards} articles ({n_pairs} pairs × {n_criteria} criteria = {n_pairs * n_criteria} comparisons)...")
+
+    # Initialize win counters for each article and criterion
+    # win_counts[article_id][criterion] = number of wins
+    win_counts: Dict[int, Dict[str, float]] = {
+        card.article_id: {crit: 0.0 for crit in criteria.keys()}
+        for card in cards
+    }
+
+    # Track all pairwise results for analysis
+    all_results: List[PairwiseResult] = []
+
+    # Generate all pairs
+    pairs = [(cards[i], cards[j]) for i in range(len(cards)) for j in range(i + 1, len(cards))]
+
+    total_comparisons = len(pairs) * len(criteria)
+    completed = 0
+
+    # Compare each pair on each criterion
+    for card_a, card_b in pairs:
+        for criterion_name, criterion_info in criteria.items():
+            try:
+                result = pairwise_compare_articles(
+                    card_a=card_a,
+                    card_b=card_b,
+                    criterion=criterion_name,
+                    criterion_description=criterion_info["description"],
+                    verbose=False,
+                    filter_think=filter_think
+                )
+                all_results.append(result)
+
+                # Update win counts
+                if result.winner == "A":
+                    win_counts[card_a.article_id][criterion_name] += 1.0
+                elif result.winner == "B":
+                    win_counts[card_b.article_id][criterion_name] += 1.0
+                else:  # TIE
+                    win_counts[card_a.article_id][criterion_name] += 0.5
+                    win_counts[card_b.article_id][criterion_name] += 0.5
+
+                completed += 1
+                if verbose and completed % 10 == 0:
+                    print(f"  Progress: {completed}/{total_comparisons} comparisons...")
+
+            except Exception as e:
+                if verbose:
+                    print(f"  ⚠ Comparison failed ({card_a.article_id} vs {card_b.article_id} on {criterion_name}): {e}")
+
+    # Convert win counts to ArticleScore objects
+    max_wins = len(cards) - 1  # Maximum wins possible per criterion
+    all_scores = []
+
+    for card in cards:
+        scores_dict = {}
+        total_weighted_score = 0.0
+
+        for criterion_name, criterion_info in criteria.items():
+            wins = win_counts[card.article_id][criterion_name]
+            score = wins_to_score(wins, max_wins)
+            scores_dict[criterion_name] = {
+                "score": round(score, 1),
+                "justification": f"Won {wins}/{max_wins} pairwise comparisons",
+                "wins": wins,
+                "median": round(score, 1)  # For consistency with absolute mode
+            }
+            total_weighted_score += score * criterion_info["weight"]
+
+        # Determine strengths and weaknesses based on relative performance
+        criterion_scores = [(name, scores_dict[name]["score"]) for name in criteria.keys()]
+        criterion_scores.sort(key=lambda x: x[1], reverse=True)
+
+        strengths = [f"Strong {name} ({score:.1f})" for name, score in criterion_scores[:2] if score >= 7]
+        weaknesses = [f"Weak {name} ({score:.1f})" for name, score in criterion_scores[-2:] if score < 6]
+
+        article_score = ArticleScore(
+            article_id=card.article_id,
+            scores=scores_dict,
+            overall_score=round(total_weighted_score, 2),
+            standout_strengths=strengths,
+            critical_weaknesses=weaknesses
+        )
+        all_scores.append(article_score)
+
+    if verbose:
+        print(f"\n✓ Pairwise scoring complete")
+        for score in all_scores:
+            print(f"  Article #{score.article_id}: {score.overall_score:.2f}")
+        print()
+
+    return all_scores
+
+
+def score_all_cards_pairwise_parallel(
+    cards: List[ArticleCard],
+    max_concurrent: int = 5,
+    criteria: Dict[str, Dict[str, Any]] = SCORING_CRITERIA,
+    verbose: bool = False,
+    filter_think: bool = True
+) -> List[ArticleScore]:
+    """
+    Score all cards using pairwise comparison with parallel execution.
+
+    Args:
+        cards: List of ArticleCards to score
+        max_concurrent: Maximum concurrent LLM requests
+        criteria: Scoring criteria dictionary
+        verbose: Enable progress logging
+        filter_think: Whether to filter out think tags from LLM responses
+
+    Returns:
+        List of ArticleScore objects with scores derived from pairwise rankings
+    """
+    if verbose:
+        print(f"\n{'='*80}")
+        print("PARALLEL PAIRWISE SCORING MODE")
+        print(f"{'='*80}")
+        n_cards = len(cards)
+        n_pairs = n_cards * (n_cards - 1) // 2
+        n_criteria = len(criteria)
+        total_comparisons = n_pairs * n_criteria
+        print(f"Comparing {n_cards} articles ({n_pairs} pairs × {n_criteria} criteria = {total_comparisons} comparisons)...")
+        print(f"Using {max_concurrent} concurrent requests...")
+
+    # Initialize win counters
+    win_counts: Dict[int, Dict[str, float]] = {
+        card.article_id: {crit: 0.0 for crit in criteria.keys()}
+        for card in cards
+    }
+
+    # Lock for thread-safe updates
+    win_lock = threading.Lock()
+
+    # Generate all comparison tasks
+    pairs = [(cards[i], cards[j]) for i in range(len(cards)) for j in range(i + 1, len(cards))]
+    tasks = [(card_a, card_b, crit_name, crit_info["description"])
+             for card_a, card_b in pairs
+             for crit_name, crit_info in criteria.items()]
+
+    progress_tracker = ThreadSafeProgressTracker(len(tasks), "PAIRWISE", verbose)
+    error_collector = ThreadSafeErrorCollector()
+
+    def worker_compare(task_tuple):
+        """Worker function for parallel pairwise comparison."""
+        card_a, card_b, criterion_name, criterion_desc = task_tuple
+        try:
+            result = pairwise_compare_articles(
+                card_a=card_a,
+                card_b=card_b,
+                criterion=criterion_name,
+                criterion_description=criterion_desc,
+                verbose=False,
+                filter_think=filter_think
+            )
+
+            # Thread-safe win count update
+            with win_lock:
+                if result.winner == "A":
+                    win_counts[card_a.article_id][criterion_name] += 1.0
+                elif result.winner == "B":
+                    win_counts[card_b.article_id][criterion_name] += 1.0
+                else:  # TIE
+                    win_counts[card_a.article_id][criterion_name] += 0.5
+                    win_counts[card_b.article_id][criterion_name] += 0.5
+
+            progress_tracker.update_progress(
+                f"{card_a.article_id}-{card_b.article_id}-{criterion_name}",
+                "compared"
+            )
+            return result
+
+        except Exception as e:
+            error_collector.add_error(
+                f"{card_a.article_id}-{card_b.article_id}-{criterion_name}",
+                e
+            )
+            raise
+
+    # Execute comparisons in parallel
+    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+        futures = {executor.submit(worker_compare, task): task for task in tasks}
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception:
+                pass  # Errors already collected
+
+    # Convert win counts to ArticleScore objects
+    max_wins = len(cards) - 1
+    all_scores = []
+
+    for card in cards:
+        scores_dict = {}
+        total_weighted_score = 0.0
+
+        for criterion_name, criterion_info in criteria.items():
+            wins = win_counts[card.article_id][criterion_name]
+            score = wins_to_score(wins, max_wins)
+            scores_dict[criterion_name] = {
+                "score": round(score, 1),
+                "justification": f"Won {wins}/{max_wins} pairwise comparisons",
+                "wins": wins,
+                "median": round(score, 1)
+            }
+            total_weighted_score += score * criterion_info["weight"]
+
+        criterion_scores = [(name, scores_dict[name]["score"]) for name in criteria.keys()]
+        criterion_scores.sort(key=lambda x: x[1], reverse=True)
+
+        strengths = [f"Strong {name} ({score:.1f})" for name, score in criterion_scores[:2] if score >= 7]
+        weaknesses = [f"Weak {name} ({score:.1f})" for name, score in criterion_scores[-2:] if score < 6]
+
+        article_score = ArticleScore(
+            article_id=card.article_id,
+            scores=scores_dict,
+            overall_score=round(total_weighted_score, 2),
+            standout_strengths=strengths,
+            critical_weaknesses=weaknesses
+        )
+        all_scores.append(article_score)
+
+    if verbose:
+        failed = len(error_collector.get_errors())
+        print(f"\n✓ Parallel pairwise scoring complete")
+        if failed > 0:
+            print(f"  Failed comparisons: {failed}")
+        for score in all_scores:
+            print(f"  Article #{score.article_id}: {score.overall_score:.2f}")
+        print()
+
     return all_scores
 
 
@@ -1515,10 +1947,11 @@ class ArticleSynthesisPipeline:
         original_user_prompt: str,
         brand_guidelines: str,
         target_word_count: int = 1500,
-        scoring_votes: int = 3,
+        scoring_votes: int = 5,
         max_synthesis_retries: int = 3,
         parallel_processing: bool = False,
-        max_concurrent: int = 5
+        max_concurrent: int = 5,
+        scoring_mode: str = "absolute"
     ) -> Dict:
         """
         Execute complete pipeline.
@@ -1528,10 +1961,11 @@ class ArticleSynthesisPipeline:
             original_user_prompt: Original topic/brief
             brand_guidelines: Company brand guidelines
             target_word_count: Desired final article length
-            scoring_votes: Number of voting rounds for scoring
+            scoring_votes: Number of voting rounds for scoring (absolute mode only)
             max_synthesis_retries: Max synthesis attempts on validation failure
             parallel_processing: Enable parallel processing for extraction stage
             max_concurrent: Maximum concurrent requests for extraction stage
+            scoring_mode: "absolute" (1-10 scores with voting) or "pairwise" (head-to-head comparison)
 
         Returns:
             Dict with final_article, validation, and all intermediate artifacts
@@ -1549,23 +1983,41 @@ class ArticleSynthesisPipeline:
                 cards = extract_all_article_cards(candidates, self.verbose, self.filter_think)
             self.artifacts['cards'] = cards
 
-            # STAGE 3: SCORE (with optional parallel processing)
-            if parallel_processing:
-                scores = score_all_cards_with_voting_parallel(
-                    cards=cards,
-                    max_concurrent=max_concurrent,
-                    votes=scoring_votes,
-                    verbose=self.verbose,
-                    filter_think=self.filter_think
-                )
+            # STAGE 3: SCORE (with scoring mode selection)
+            if scoring_mode == "pairwise":
+                # Pairwise comparison mode for more stable rankings
+                if parallel_processing:
+                    scores = score_all_cards_pairwise_parallel(
+                        cards=cards,
+                        max_concurrent=max_concurrent,
+                        verbose=self.verbose,
+                        filter_think=self.filter_think
+                    )
+                else:
+                    scores = score_all_cards_pairwise(
+                        cards=cards,
+                        verbose=self.verbose,
+                        filter_think=self.filter_think
+                    )
             else:
-                scores = score_all_cards_with_voting(
-                    cards,
-                    votes=scoring_votes,
-                    verbose=self.verbose,
-                    filter_think=self.filter_think
-                )
+                # Absolute scoring mode (default) with voting
+                if parallel_processing:
+                    scores = score_all_cards_with_voting_parallel(
+                        cards=cards,
+                        max_concurrent=max_concurrent,
+                        votes=scoring_votes,
+                        verbose=self.verbose,
+                        filter_think=self.filter_think
+                    )
+                else:
+                    scores = score_all_cards_with_voting(
+                        cards,
+                        votes=scoring_votes,
+                        verbose=self.verbose,
+                        filter_think=self.filter_think
+                    )
             self.artifacts['scores'] = scores
+            self.artifacts['scoring_mode'] = scoring_mode
 
             # STAGE 4: SELECT
             blueprint = select_best_elements(cards, scores, self.verbose, self.filter_think)
@@ -2027,8 +2479,8 @@ def main():
     parser.add_argument(
         "--synthesis-votes",
         type=int,
-        default=3,
-        help="Number of scoring votes in synthesis pipeline (default: 3)"
+        default=5,
+        help="Number of scoring votes in synthesis pipeline (default: 5)"
     )
     parser.add_argument(
         "--synthesis-retries",
@@ -2059,7 +2511,13 @@ def main():
         default=15,
         help="Maximum concurrent LLM requests when using --parallel (default: 5)"
     )
-    
+    parser.add_argument(
+        "--scoring-mode",
+        choices=["absolute", "pairwise"],
+        default="absolute",
+        help="Scoring method: 'absolute' (1-10 per criterion) or 'pairwise' (head-to-head comparison)"
+    )
+
     args = parser.parse_args()
     
     # Handle cleanup if requested
@@ -2226,7 +2684,8 @@ When writing marketing content, always:
                 scoring_votes=args.synthesis_votes,
                 max_synthesis_retries=args.synthesis_retries,
                 parallel_processing=args.parallel,
-                max_concurrent=args.max_concurrent
+                max_concurrent=args.max_concurrent,
+                scoring_mode=args.scoring_mode
             )
             
             # Save all pipeline outputs

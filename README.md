@@ -6,7 +6,7 @@ A sophisticated marketing blog post generation tool that uses a local OpenAI-com
 
 - **Parallel Article Generation**: Generate multiple article candidates concurrently using ThreadPoolExecutor
 - **6-Stage Synthesis Pipeline**: CANDIDATES → EXTRACT → SCORE → SELECT → SYNTHESIZE → VALIDATE
-- **Quality Scoring**: Evaluates articles on 7 quality dimensions with voting to reduce variance
+- **Quality Scoring**: Evaluates articles on 7 quality dimensions with two scoring modes (absolute and pairwise) for improved consistency
 - **Validation Loop**: Automatically regenerates content that doesn't meet quality thresholds
 - **Comprehensive Metrics**: Tracks words, tokens, execution times, and LLM calls across all stages
 - **Thread-Safe Operations**: Safe parallel processing with progress tracking and error collection
@@ -53,9 +53,10 @@ OPENAI_MODEL_NAME=your-model-name           # Model name to use
 |------|------|---------|-------------|
 | `--candidates-only` | flag | False | Generate candidate articles only, skip the synthesis pipeline. Useful for creating a pool of candidates to review before synthesis. |
 | `--candidates-dir` | string | - | Path to a folder containing candidate markdown files. Skips candidate generation and loads from files. Enables running synthesis on previously generated candidates. |
-| `--synthesis-votes` | int | 3 | Number of scoring votes in the synthesis pipeline. More votes increase consistency but take longer. |
+| `--synthesis-votes` | int | 5 | Number of scoring votes in the synthesis pipeline (absolute mode only). More votes increase consistency but take longer. |
 | `--synthesis-retries` | int | 3 | Maximum synthesis attempts on validation failure. The pipeline will retry up to this many times. |
 | `--target-word-count` | int | 1500 | Target word count for the synthesized article. The final article will aim to meet this length. |
+| `--scoring-mode` | string | absolute | Scoring method: `absolute` (1-10 scores per criterion with voting) or `pairwise` (head-to-head article comparison). Pairwise mode is more stable but requires more LLM calls. |
 
 ### Parallel Processing Options
 
@@ -112,9 +113,35 @@ Load previously generated candidates and run the full synthesis pipeline:
 
 ```bash
 python post_generator.py \
-  --candidates-dir outputs/2024-01-15/blog_candidate \
+  --candidates-dir outputs/2024-01-15/blog_candidates \
   --output final_article \
   --synthesis-votes 5 \
+  --verbose
+```
+
+### Pairwise Scoring Mode
+
+Use pairwise comparison for more stable, consistent scoring (compares articles head-to-head):
+
+```bash
+python post_generator.py \
+  --candidates-dir outputs/2024-01-15/blog_candidates \
+  --output final_article \
+  --scoring-mode pairwise \
+  --verbose
+```
+
+### Pairwise Scoring with Parallel Processing
+
+Run pairwise comparisons in parallel for faster execution:
+
+```bash
+python post_generator.py \
+  --candidates-dir outputs/2024-01-15/blog_candidates \
+  --output final_article \
+  --scoring-mode pairwise \
+  --parallel \
+  --max-concurrent 10 \
   --verbose
 ```
 
@@ -234,6 +261,36 @@ python post_generator.py \
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+## Scoring Modes
+
+The pipeline supports two scoring modes to evaluate article quality:
+
+### Absolute Mode (Default)
+
+Each article is scored independently on a 1-10 scale for each criterion. Multiple votes are taken and averaged to reduce variance.
+
+**Improvements in absolute mode:**
+- Temperature set to 0.0 for maximum consistency
+- 5 votes per article (configurable via `--synthesis-votes`)
+- Median-based outlier detection removes scores >2 std from median
+- Reports high-variance criteria for debugging
+
+**Best for:** Smaller candidate sets (2-5 articles), when you need interpretable 1-10 scores.
+
+### Pairwise Mode
+
+Articles are compared head-to-head on each criterion: "Which article has a stronger hook, A or B?" Win counts are converted to 1-10 scores.
+
+**How it works:**
+- For N articles: N×(N-1)/2 pairs per criterion
+- 7 criteria = 21 comparisons for 3 articles, 315 for 10 articles
+- Ties give 0.5 wins to each article
+- Win counts normalized to 1-10 scale
+
+**Best for:** Larger candidate sets (5-10 articles), when scoring consistency is critical, when you want more stable rankings.
+
+**Trade-off:** More LLM calls, but relative comparisons are cognitively easier for the model than absolute judgments.
+
 ## Scoring Criteria
 
 The synthesis pipeline evaluates content on seven key dimensions:
@@ -308,7 +365,14 @@ The tool uses reference context files located in:
 - `reference_context/writing_style-enhanced.md` - Writing style guidelines
 - `reference_context/construkted_context.md` - Company context and mission
 - `reference_context/Combined_Small_Team_Geospatial_Market_Analysis.md` - Market research
-- `prompts/` - Stage-specific prompts for the synthesis pipeline
+
+Pipeline stage prompts in `prompts/`:
+- `pipeline_stage2_extract_system.md` - Article extraction to structured cards
+- `pipeline_stage3_score_system.md` - Absolute scoring (1-10 per criterion)
+- `pipeline_stage3_pairwise_system.md` - Pairwise comparison scoring
+- `pipeline_stage4_select_system.md` - Best element selection
+- `pipeline_stage5_synthesize_system.md` - Final article synthesis
+- `pipeline_stage6_validate_system.md` - Quality validation
 
 ## Error Handling
 
