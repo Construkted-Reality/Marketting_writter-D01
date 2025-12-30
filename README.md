@@ -468,10 +468,31 @@ outputs/
         ├── {output_base}_validation.json    # Validation report
         ├── {output_base}_pipeline_artifacts.json  # All intermediate data
         └── candidates/
-            ├── {output_base}_candidate_01.md
-            ├── {output_base}_candidate_02.md
+            ├── {output_base}_candidate_01_{preset_name}.md
+            ├── {output_base}_candidate_02_{preset_name}.md
             └── ...
 ```
+
+### Candidate Filenames
+
+Candidate files include the model preset name for easy identification of which LLM model was used to generate each candidate:
+
+- **Single candidate**: `{output_base}_{preset_name}.md`
+- **Multiple candidates**: `{output_base}_candidate_{id:02d}_{preset_name}.md`
+
+**Examples:**
+- `my_article_candidate_01_or-kimik2-0905.md` - Generated with OpenRouter's Kimi K2 0905
+- `my_article_candidate_02_local-minimax.md` - Generated with local MiniMax model
+- `my_article_candidate_03_openai-4o.md` - Generated with OpenAI's GPT-4o
+
+Each candidate file also includes the model information in the file footer:
+```markdown
+---
+**Word Count: 1234**
+**Model: or-kimik2-0905**
+```
+
+This makes it easy to identify which model generated each candidate, especially when using multiple presets in a single run.
 
 ## Metrics Summary
 

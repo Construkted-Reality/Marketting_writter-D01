@@ -147,6 +147,7 @@ class ArticleCandidate:
     content: str
     word_count: int
     generation_timestamp: float
+    preset_name: str = ""  # Model preset used for generation
 
 @dataclass
 class ArticleCard:
@@ -2408,7 +2409,8 @@ def generate_single_candidate(
         article_id=article_id,
         content=response,
         word_count=len(response.split()),
-        generation_timestamp=time.time()
+        generation_timestamp=time.time(),
+        preset_name=preset_name
     )
 
     if verbose:
@@ -2426,7 +2428,7 @@ def save_candidate_file(
 ) -> None:
     """
     Save a single candidate file (thread-safe).
-    
+
     Args:
         candidate: ArticleCandidate to save
         output_dir: Output directory path
@@ -2434,16 +2436,19 @@ def save_candidate_file(
         total_iterations: Total number of iterations
         verbose: Enable verbose logging
     """
+    # Clean preset name for filename (replace slashes and special chars with dashes)
+    safe_preset = candidate.preset_name.replace('/', '-').replace('\\', '-')
+
     if total_iterations == 1:
-        filename = output_dir / f"{output_base}.md"
+        filename = output_dir / f"{output_base}_{safe_preset}.md"
     else:
-        filename = output_dir / "candidates" / f"{output_base}_candidate_{candidate.article_id:02d}.md"
-    
+        filename = output_dir / "candidates" / f"{output_base}_candidate_{candidate.article_id:02d}_{safe_preset}.md"
+
     filename.write_text(
-        candidate.content + f"\n\n---\n**Word Count: {candidate.word_count}**",
+        candidate.content + f"\n\n---\n**Word Count: {candidate.word_count}**\n**Model: {candidate.preset_name}**",
         encoding='utf-8'
     )
-    
+
     if verbose:
         print(f"  Candidate {candidate.article_id} saved: {filename}")
 
@@ -2606,25 +2611,46 @@ def load_candidate_files(
     for idx, md_file in enumerate(md_files, start=1):
         try:
             content = md_file.read_text(encoding="utf-8")
-            
+
             # Extract word count from content if present (format: "**Word Count: N**")
             word_count_match = re.search(r'\*\*Word Count:\s*(\d+)\*\*', content)
             word_count = int(word_count_match.group(1)) if word_count_match else len(content.split())
-            
-            # Clean up the word count footer if present
-            clean_content = re.sub(r'\n\n---\n\*\*Word Count:\s*\d+\*\*', '', content)
-            
+
+            # Extract preset name from content if present (format: "**Model: preset-name**")
+            preset_match = re.search(r'\*\*Model:\s*([^\*]+)\*\*', content)
+            preset_name = preset_match.group(1).strip() if preset_match else ""
+
+            # If not found in content, try to extract from filename
+            # Expected format: *_candidate_NN_preset-name.md or *_preset-name.md
+            if not preset_name:
+                filename_parts = md_file.stem.split('_')
+                # Try to find preset in filename (after candidate_NN or at the end)
+                for i, part in enumerate(filename_parts):
+                    if part.startswith('candidate') and i + 1 < len(filename_parts):
+                        # Next part after candidate_NN should be preset
+                        if i + 2 < len(filename_parts):
+                            preset_name = '_'.join(filename_parts[i+2:])
+                            break
+                if not preset_name and len(filename_parts) > 1:
+                    # Fallback: last part of filename might be preset
+                    preset_name = filename_parts[-1]
+
+            # Clean up the footer if present (word count and model info)
+            clean_content = re.sub(r'\n\n---\n\*\*Word Count:\s*\d+\*\*(\n\*\*Model:\s*[^\*]+\*\*)?', '', content)
+
             candidate = ArticleCandidate(
                 article_id=idx,
                 content=clean_content.strip(),
                 word_count=word_count,
-                generation_timestamp=time.time()
+                generation_timestamp=time.time(),
+                preset_name=preset_name
             )
             candidates.append(candidate)
-            
+
             if verbose:
-                print(f"  Loaded: {md_file.name} ({word_count} words)")
-                
+                model_info = f" [{preset_name}]" if preset_name else ""
+                print(f"  Loaded: {md_file.name} ({word_count} words{model_info})")
+
         except Exception as e:
             if verbose:
                 print(f"  ✗ Failed to load {md_file.name}: {e}")
@@ -2931,25 +2957,21 @@ When writing marketing content, always:
                             article_id=article_id,
                             content=response,
                             word_count=len(response.split()),
-                            generation_timestamp=time.time()
+                            generation_timestamp=time.time(),
+                            preset_name=preset_name
                         )
                         candidates.append(candidate)
 
                         # Save individual candidate files to organized structure
                         if args.output:
                             output_dir = create_output_directory(args.output)
-
-                            if actual_total_candidates == 1:
-                                filename = output_dir / f"{args.output}.md"
-                            else:
-                                filename = output_dir / "candidates" / f"{args.output}_candidate_{article_id:02d}.md"
-
-                            filename.write_text(
-                                response + f"\n\n---\n**Word Count: {candidate.word_count}**\n**Generated with: {preset_name}**",
-                                encoding='utf-8'
+                            save_candidate_file(
+                                candidate,
+                                output_dir,
+                                args.output,
+                                actual_total_candidates,
+                                verbose=args.verbose
                             )
-                            if args.verbose:
-                                print(f"Candidate saved: {filename}")
 
                         article_id += 1
             
