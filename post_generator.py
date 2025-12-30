@@ -11,6 +11,7 @@ Includes comprehensive metrics tracking for words, tokens, and execution times.
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -283,7 +284,9 @@ def list_available_presets(config_path: str = "models.yaml") -> None:
             print(f"    Description: {description}")
 
     print("\n" + "=" * 60)
-    print(f"Usage: python post_generator.py --preset <preset_name> ...")
+    print("Usage examples:")
+    print("  python post_generator.py --candidate-presets local-qwen,local-minimax --iterations 6")
+    print("  python post_generator.py --pipeline-preset local-qwen --candidate-presets local-minimax")
     print("=" * 60 + "\n")
 
 
@@ -297,6 +300,9 @@ def get_preset_config(preset_name: str, config_path: str = "models.yaml") -> Tup
     Returns:
         Tuple of (base_url, api_key, model_name)
     """
+    # Ensure .env is loaded so API keys are available
+    load_dotenv()
+
     config = load_models_config(config_path)
 
     presets = config.get("presets", {})
@@ -532,6 +538,87 @@ def send_to_llm(
                     print(f"Retrying in {retry_delay} seconds...")
                 time.sleep(retry_delay)
     
+    # If we get here, all retries failed
+    raise RuntimeError(f"Failed to get response from LLM after {retry_count} attempts. Last error: {last_error}")
+
+
+def send_to_llm_with_preset(
+    preset_name: str,
+    llm_user_prompt: str,
+    llm_system_prompt: Optional[str] = None,
+    temperature: float = 0.7,
+    max_tokens: int = 4000,
+    retry_count: int = 3,
+    retry_delay: float = 1.0,
+    verbose: bool = False,
+    seed: Optional[int] = None
+) -> str:
+    """
+    Send prompt to a specific model preset without modifying global environment.
+
+    Args:
+        preset_name: Name of the preset to use (from models.yaml)
+        llm_user_prompt: User prompt/instruction
+        llm_system_prompt: System prompt (uses built-in prompt if None)
+        temperature: Sampling temperature (default 0.7)
+        max_tokens: Maximum tokens to generate (default 4000)
+        retry_count: Number of API call retries (default 3)
+        retry_delay: Delay between retries in seconds (default 1.0)
+        verbose: Enable verbose logging (default False)
+        seed: Optional seed for reproducible outputs (default None)
+
+    Returns:
+        The LLM response content as a string
+    """
+    # Get preset configuration
+    base_url, api_key, model_name = get_preset_config(preset_name)
+
+    # Create OpenAI client with preset-specific configuration
+    client = OpenAI(
+        api_key=api_key,
+        base_url=base_url
+    )
+
+    if llm_system_prompt is None:
+        print("WARNING: System prompt missing.")
+
+    # Prepare messages for the API
+    messages = [
+        {"role": "system", "content": llm_system_prompt},
+        {"role": "user", "content": llm_user_prompt}
+    ]
+
+    last_error = None
+    for attempt in range(retry_count):
+        try:
+            # Make API call with preset-specific model
+            api_params = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens
+            }
+            if seed is not None:
+                api_params["seed"] = seed
+            response = client.chat.completions.create(**api_params)  # type: ignore[arg-type]
+
+            # Extract and return the response content
+            response_content = response.choices[0].message.content
+            if response_content is None:
+                raise ValueError("Empty response from LLM")
+
+            return response_content.strip()
+
+        except Exception as e:
+            last_error = e
+            if verbose:
+                print(f"API call attempt {attempt + 1} failed: {e}")
+
+            if attempt < retry_count - 1:  # Don't sleep on the last attempt
+                if verbose:
+                    print(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+
     # If we get here, all retries failed
     raise RuntimeError(f"Failed to get response from LLM after {retry_count} attempts. Last error: {last_error}")
 
@@ -2259,7 +2346,8 @@ def save_pipeline_artifacts(
 # ============================================================================
 
 def generate_single_candidate(
-    iteration: int,
+    article_id: int,
+    preset_name: str,
     generation_system_prompt: str,
     generation_user_prompt: str,
     temperature: float,
@@ -2270,10 +2358,11 @@ def generate_single_candidate(
     verbose: bool
 ) -> ArticleCandidate:
     """
-    Generate a single article candidate (thread-safe worker function).
-    
+    Generate a single article candidate using a specific preset (thread-safe worker function).
+
     Args:
-        iteration: Candidate iteration number
+        article_id: Candidate article ID number
+        preset_name: Name of the model preset to use
         generation_system_prompt: System prompt for generation
         generation_user_prompt: User prompt for generation
         temperature: Sampling temperature
@@ -2282,19 +2371,20 @@ def generate_single_candidate(
         retry_delay: Delay between retries
         filter_think: Whether to filter think tags
         verbose: Enable verbose logging
-        
+
     Returns:
         ArticleCandidate object
     """
     if verbose:
-        print(f"  [Thread {threading.current_thread().name}] Generating candidate {iteration}...")
-    
+        print(f"  [Thread {threading.current_thread().name}] Generating candidate {article_id} with {preset_name}...")
+
     # Prepare input text for metrics tracking
     input_text = generation_system_prompt + "\n\n" + generation_user_prompt
-    
-    # Send to LLM with timing
+
+    # Send to LLM with timing using preset-specific configuration
     llm_start_time = time.time()
-    response = send_to_llm(
+    response = send_to_llm_with_preset(
+        preset_name=preset_name,
         llm_user_prompt=generation_user_prompt,
         llm_system_prompt=generation_system_prompt,
         temperature=temperature,
@@ -2305,25 +2395,25 @@ def generate_single_candidate(
     )
     llm_end_time = time.time()
     execution_time = llm_end_time - llm_start_time
-    
+
     # Apply think tag filtering if requested
     if filter_think:
         response = filter_think_tags(response)
-    
+
     # Track LLM call metrics (thread-safe)
     track_llm_call("CANDIDATES", input_text, response, execution_time)
-    
+
     # Create candidate object
     candidate = ArticleCandidate(
-        article_id=iteration,
+        article_id=article_id,
         content=response,
         word_count=len(response.split()),
         generation_timestamp=time.time()
     )
-    
+
     if verbose:
-        print(f"  [Thread {threading.current_thread().name}] ✓ Candidate {iteration} complete ({candidate.word_count} words)")
-    
+        print(f"  [Thread {threading.current_thread().name}] ✓ Candidate {article_id} ({preset_name}) complete ({candidate.word_count} words)")
+
     return candidate
 
 
@@ -2359,7 +2449,7 @@ def save_candidate_file(
 
 
 def generate_candidates_parallel(
-    iterations: int,
+    preset_iterations: List[Tuple[str, int]],
     generation_system_prompt: str,
     generation_user_prompt: str,
     temperature: float,
@@ -2373,9 +2463,12 @@ def generate_candidates_parallel(
 ) -> List[ArticleCandidate]:
     """
     Generate multiple article candidates in parallel using ThreadPoolExecutor.
-    
+
+    Distributes generation across multiple presets, with each preset generating
+    a specified number of candidates.
+
     Args:
-        iterations: Number of candidates to generate
+        preset_iterations: List of (preset_name, iterations_count) tuples
         generation_system_prompt: System prompt for generation
         generation_user_prompt: User prompt for generation
         temperature: Sampling temperature
@@ -2386,30 +2479,44 @@ def generate_candidates_parallel(
         output_base: Base filename for outputs (optional)
         max_concurrent: Maximum concurrent LLM requests
         verbose: Enable verbose logging
-        
+
     Returns:
         List of ArticleCandidate objects
     """
+    # Calculate total iterations
+    total_iterations = sum(count for _, count in preset_iterations)
+
     if verbose:
         print(f"\n{'='*80}")
-        print(f"PARALLEL CANDIDATE GENERATION")
+        print(f"PARALLEL CANDIDATE GENERATION (Multi-Preset)")
         print(f"{'='*80}")
-        print(f"Generating {iterations} candidates with max {max_concurrent} concurrent requests...")
-    
+        print(f"Generating {total_iterations} candidates with max {max_concurrent} concurrent requests...")
+        for preset_name, count in preset_iterations:
+            print(f"  - {preset_name}: {count} candidates")
+
     candidates = []
-    
+
     # Create output directory if needed
     output_dir = None
     if output_base:
         output_dir = create_output_directory(output_base)
-    
+
+    # Build list of (article_id, preset_name) tasks
+    tasks = []
+    article_id = 1
+    for preset_name, iterations_count in preset_iterations:
+        for _ in range(iterations_count):
+            tasks.append((article_id, preset_name))
+            article_id += 1
+
     # Use ThreadPoolExecutor for parallel generation
     with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
         # Submit all generation tasks
-        future_to_iteration = {
+        future_to_task = {
             executor.submit(
                 generate_single_candidate,
-                iteration,
+                task_article_id,
+                task_preset_name,
                 generation_system_prompt,
                 generation_user_prompt,
                 temperature,
@@ -2418,42 +2525,42 @@ def generate_candidates_parallel(
                 retry_delay,
                 filter_think,
                 verbose
-            ): iteration
-            for iteration in range(1, iterations + 1)
+            ): (task_article_id, task_preset_name)
+            for task_article_id, task_preset_name in tasks
         }
-        
+
         # Collect results as they complete
         completed = 0
-        for future in as_completed(future_to_iteration):
-            iteration = future_to_iteration[future]
+        for future in as_completed(future_to_task):
+            task_article_id, task_preset_name = future_to_task[future]
             try:
                 candidate = future.result()
                 candidates.append(candidate)
                 completed += 1
-                
+
                 if verbose:
-                    print(f"Progress: {completed}/{iterations} candidates complete")
-                
+                    print(f"Progress: {completed}/{total_iterations} candidates complete")
+
                 # Save candidate file if output is specified
                 if output_base and output_dir:
                     save_candidate_file(
                         candidate,
                         output_dir,
                         output_base,
-                        iterations,
+                        total_iterations,
                         verbose=False  # Reduce verbosity in parallel mode
                     )
-                    
+
             except Exception as e:
                 if verbose:
-                    print(f"  ✗ Candidate {iteration} failed: {e}")
-    
+                    print(f"  ✗ Candidate {task_article_id} ({task_preset_name}) failed: {e}")
+
     # Sort candidates by article_id to maintain order
     candidates.sort(key=lambda c: c.article_id)
-    
+
     if verbose:
-        print(f"✓ Parallel generation complete: {len(candidates)}/{iterations} candidates generated\n")
-    
+        print(f"✓ Parallel generation complete: {len(candidates)}/{total_iterations} candidates generated\n")
+
     return candidates
 
 
@@ -2537,8 +2644,12 @@ def main():
 
     # Model selection arguments
     parser.add_argument(
-        "--preset",
-        help="Model preset to use (e.g., 'local-minimax', 'local-qwen'). See --list-models for available presets."
+        "--pipeline-preset",
+        help="Model preset for pipeline stages (EXTRACT, SCORE, SELECT, SYNTHESIZE, VALIDATE). Uses default_preset from models.yaml if not specified."
+    )
+    parser.add_argument(
+        "--candidate-presets",
+        help="Comma-separated list of model presets for CANDIDATES stage (e.g., 'local-qwen,local-minimax,openai-4o'). Iterations are distributed across presets (rounded up). Uses default_preset if not specified."
     )
     parser.add_argument(
         "--list-models",
@@ -2665,17 +2776,47 @@ def main():
         return 0
 
     try:
-        # Load environment variables with optional preset
-        if args.verbose:
-            if args.preset:
-                print(f"Loading preset: {args.preset}")
-            else:
-                print("Loading default model configuration...")
-        load_environment(preset=args.preset)
+        # ====================================================================
+        # PARSE CANDIDATE PRESETS AND CALCULATE ITERATIONS
+        # ====================================================================
+
+        # Load models config to get default preset
+        try:
+            models_config = load_models_config()
+            default_preset = models_config.get("default_preset")
+        except FileNotFoundError:
+            default_preset = None
+
+        # Parse candidate presets (comma-delimited list or default)
+        if args.candidate_presets:
+            candidate_preset_list = [p.strip() for p in args.candidate_presets.split(',')]
+        elif default_preset:
+            candidate_preset_list = [default_preset]
+        else:
+            raise ValueError("No candidate presets specified and no default_preset in models.yaml")
+
+        # Calculate iterations per preset (round up to distribute evenly)
+        iterations_per_preset = math.ceil(args.iterations / len(candidate_preset_list))
+        actual_total_candidates = iterations_per_preset * len(candidate_preset_list)
+
+        # Build list of (preset_name, iterations_count) for generation
+        preset_iterations = [(preset, iterations_per_preset) for preset in candidate_preset_list]
 
         if args.verbose:
-            print(f"API Base URL: {os.getenv('OPENAI_API_BASE')}")
-            print(f"Model Name: {os.getenv('OPENAI_MODEL_NAME')}")
+            print(f"\n{'='*80}")
+            print("CANDIDATE GENERATION CONFIGURATION")
+            print(f"{'='*80}")
+            print(f"Requested iterations: {args.iterations}")
+            print(f"Candidate presets: {candidate_preset_list}")
+            print(f"Iterations per preset: {iterations_per_preset}")
+            if actual_total_candidates > args.iterations:
+                print(f"Note: Generating {actual_total_candidates} total candidates (rounded up)")
+            print(f"{'='*80}\n")
+
+        # Determine pipeline preset (for EXTRACT, SCORE, SELECT, SYNTHESIZE, VALIDATE)
+        pipeline_preset = args.pipeline_preset if args.pipeline_preset else default_preset
+
+        if args.verbose:
             print("Using built-in system and user prompts for Construkted Reality marketing content")
         
         # Build prompts
@@ -2731,9 +2872,9 @@ When writing marketing content, always:
             # Mode 1 or 3: Generate candidates (default or --candidates-only)
             # Choose parallel or sequential generation
             if args.parallel:
-                # Parallel generation using ThreadPoolExecutor
+                # Parallel generation using ThreadPoolExecutor with multi-preset support
                 candidates = generate_candidates_parallel(
-                    iterations=args.iterations,
+                    preset_iterations=preset_iterations,
                     generation_system_prompt=generation_system_prompt,
                     generation_user_prompt=generation_user_prompt,
                     temperature=args.temperature,
@@ -2746,63 +2887,71 @@ When writing marketing content, always:
                     verbose=args.verbose
                 )
             else:
-                # Sequential generation (original implementation)
+                # Sequential generation with multi-preset support
                 candidates = []
-                
-                for iteration in range(1, args.iterations + 1):
+                article_id = 1
+
+                for preset_name, preset_iter_count in preset_iterations:
                     if args.verbose:
-                        print(f"\nGenerating candidate {iteration}/{args.iterations}...")
-                    
-                    # Prepare input text for metrics tracking
-                    input_text = generation_system_prompt + "\n\n" + generation_user_prompt
-                    
-                    # Send to LLM with timing
-                    llm_start_time = time.time()
-                    response = send_to_llm(
-                        llm_user_prompt=generation_user_prompt,
-                        llm_system_prompt=generation_system_prompt,
-                        temperature=args.temperature,
-                        max_tokens=args.max_tokens,
-                        retry_count=args.retry_count,
-                        retry_delay=args.retry_delay,
-                        verbose=args.verbose
-                    )
-                    llm_end_time = time.time()
-                    execution_time = llm_end_time - llm_start_time
-                    
-                    # Apply think tag filtering if requested
-                    if args.filter_think:
+                        print(f"\n--- Generating with preset: {preset_name} ---")
+
+                    for i in range(preset_iter_count):
                         if args.verbose:
-                            print("Filtering out content between <think> tags...")
-                        response = filter_think_tags(response)
-                    
-                    # Track LLM call metrics
-                    track_llm_call("CANDIDATES", input_text, response, execution_time)
-                    
-                    # Store candidate in memory
-                    candidate = ArticleCandidate(
-                        article_id=iteration,
-                        content=response,
-                        word_count=len(response.split()),
-                        generation_timestamp=time.time()
-                    )
-                    candidates.append(candidate)
-                    
-                    # Save individual candidate files to organized structure
-                    if args.output:
-                        output_dir = create_output_directory(args.output)
-                        
-                        if args.iterations == 1:
-                            filename = output_dir / f"{args.output}.md"
-                        else:
-                            filename = output_dir / "candidates" / f"{args.output}_candidate_{iteration:02d}.md"
-                        
-                        filename.write_text(
-                            response + f"\n\n---\n**Word Count: {candidate.word_count}**",
-                            encoding='utf-8'
+                            print(f"Generating candidate {article_id}/{actual_total_candidates} using {preset_name}...")
+
+                        # Prepare input text for metrics tracking
+                        input_text = generation_system_prompt + "\n\n" + generation_user_prompt
+
+                        # Send to LLM with timing using preset-specific configuration
+                        llm_start_time = time.time()
+                        response = send_to_llm_with_preset(
+                            preset_name=preset_name,
+                            llm_user_prompt=generation_user_prompt,
+                            llm_system_prompt=generation_system_prompt,
+                            temperature=args.temperature,
+                            max_tokens=args.max_tokens,
+                            retry_count=args.retry_count,
+                            retry_delay=args.retry_delay,
+                            verbose=args.verbose
                         )
-                        if args.verbose:
-                            print(f"Candidate saved: {filename}")
+                        llm_end_time = time.time()
+                        execution_time = llm_end_time - llm_start_time
+
+                        # Apply think tag filtering if requested
+                        if args.filter_think:
+                            if args.verbose:
+                                print("Filtering out content between <think> tags...")
+                            response = filter_think_tags(response)
+
+                        # Track LLM call metrics
+                        track_llm_call("CANDIDATES", input_text, response, execution_time)
+
+                        # Store candidate in memory
+                        candidate = ArticleCandidate(
+                            article_id=article_id,
+                            content=response,
+                            word_count=len(response.split()),
+                            generation_timestamp=time.time()
+                        )
+                        candidates.append(candidate)
+
+                        # Save individual candidate files to organized structure
+                        if args.output:
+                            output_dir = create_output_directory(args.output)
+
+                            if actual_total_candidates == 1:
+                                filename = output_dir / f"{args.output}.md"
+                            else:
+                                filename = output_dir / "candidates" / f"{args.output}_candidate_{article_id:02d}.md"
+
+                            filename.write_text(
+                                response + f"\n\n---\n**Word Count: {candidate.word_count}**\n**Generated with: {preset_name}**",
+                                encoding='utf-8'
+                            )
+                            if args.verbose:
+                                print(f"Candidate saved: {filename}")
+
+                        article_id += 1
             
             # Add total execution time for candidates stage (only if we actually generated)
             stage_end_time = time.time()
@@ -2811,9 +2960,26 @@ When writing marketing content, always:
         # ====================================================================
         # STAGES 2-6: SYNTHESIS PIPELINE (or skip if --candidates-only)
         # ====================================================================
-        
+
         # Run synthesis pipeline unless --candidates-only is set
         if not args.candidates_only:
+            # Load pipeline preset for synthesis stages (EXTRACT, SCORE, SELECT, SYNTHESIZE, VALIDATE)
+            if args.verbose:
+                print(f"\n{'='*80}")
+                print("LOADING PIPELINE PRESET FOR SYNTHESIS STAGES")
+                print(f"{'='*80}")
+                if pipeline_preset:
+                    print(f"Pipeline preset: {pipeline_preset}")
+                else:
+                    print("Using default model configuration...")
+
+            load_environment(preset=pipeline_preset)
+
+            if args.verbose:
+                print(f"API Base URL: {os.getenv('OPENAI_API_BASE')}")
+                print(f"Model Name: {os.getenv('OPENAI_MODEL_NAME')}")
+                print(f"{'='*80}\n")
+
             pipeline = ArticleSynthesisPipeline(verbose=args.verbose, filter_think=args.filter_think)
 
             result = pipeline.run(

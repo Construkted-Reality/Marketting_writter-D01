@@ -60,7 +60,7 @@ presets:
     model: gpt-4o
     description: "OpenAI GPT-4o"
 
-default_preset: local-minimax  # Used when no --preset flag specified
+default_preset: local-minimax  # Used when no preset flags specified
 ```
 
 ### Environment Variables (`.env`)
@@ -115,10 +115,20 @@ default_preset: local-qwen  # Change this to any preset name
 
 ### Model Selection Options
 
+The tool supports **separate model presets** for candidate generation vs. pipeline stages:
+
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--preset` | string | - | Model preset to use (e.g., 'local-minimax', 'local-qwen'). Overrides the default preset from `models.yaml`. |
+| `--candidate-presets` | string | default_preset | Comma-separated list of model presets for the CANDIDATES stage (e.g., `local-qwen,local-minimax,openai-4o`). Iterations are distributed across presets (rounded up). |
+| `--pipeline-preset` | string | default_preset | Model preset for pipeline stages (EXTRACT, SCORE, SELECT, SYNTHESIZE, VALIDATE). |
 | `--list-models` | flag | False | List all available model presets and exit. Shows providers, models, and descriptions. |
+
+**Multi-Model Candidate Generation:**
+
+When using multiple candidate presets, iterations are distributed evenly across models. If the total doesn't divide evenly, it rounds up:
+
+- `--iterations 6 --candidate-presets a,b,c` → 2 candidates each (6 total)
+- `--iterations 7 --candidate-presets a,b,c` → 3 candidates each (9 total, rounded up)
 
 ### Generation Options
 
@@ -178,22 +188,40 @@ python post_generator.py --topic-file prompts/construkted_globe.txt --output my_
 
 ### Generate with a Specific Model
 
-Use a different model preset:
+Use a specific model for all stages:
 
 ```bash
 python post_generator.py \
-  --preset local-qwen \
+  --candidate-presets local-qwen \
+  --pipeline-preset local-qwen \
   --topic-file prompts/construkted_globe.txt \
   --output my_article
 ```
 
-### Multiple Candidate Generation
+### Multi-Model Candidate Generation
 
-Generate 5 candidate articles in parallel using a specific model:
+Generate candidates using multiple different models, then synthesize with a single model:
 
 ```bash
 python post_generator.py \
-  --preset local-minimax \
+  --candidate-presets local-qwen,local-minimax,openai-4o \
+  --pipeline-preset local-qwen \
+  --topic-file prompts/construkted_globe.txt \
+  --output diverse_candidates \
+  --iterations 6 \
+  --parallel \
+  --verbose
+```
+
+This generates 2 candidates per model (6 total), then uses `local-qwen` for all synthesis stages.
+
+### Multiple Candidate Generation (Single Model)
+
+Generate 5 candidate articles in parallel using a single model:
+
+```bash
+python post_generator.py \
+  --candidate-presets local-minimax \
   --topic-file prompts/construkted_globe.txt \
   --output blog_candidates \
   --iterations 5 \
@@ -207,7 +235,7 @@ Generate candidates without running synthesis (useful for reviewing before selec
 
 ```bash
 python post_generator.py \
-  --preset local-qwen-think \
+  --candidate-presets local-qwen-think \
   --topic-file prompts/construkted_globe.txt \
   --output review_candidates \
   --iterations 3 \
@@ -222,6 +250,7 @@ Load previously generated candidates and run the full synthesis pipeline:
 ```bash
 python post_generator.py \
   --candidates-dir outputs/2024-01-15/blog_candidates \
+  --pipeline-preset local-qwen \
   --output final_article \
   --synthesis-votes 5 \
   --verbose
@@ -307,9 +336,11 @@ Complete synthesis pipeline with all options customized:
 
 ```bash
 python post_generator.py \
+  --candidate-presets local-qwen,local-minimax,openai-4o \
+  --pipeline-preset local-qwen \
   --topic-file prompts/construkted_globe.txt \
   --output full_synthesis \
-  --iteration 5 \
+  --iterations 6 \
   --parallel \
   --max-concurrent 5 \
   --synthesis-votes 3 \
@@ -322,52 +353,64 @@ python post_generator.py \
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    ARTICLE SYNTHESIS PIPELINE                   │
+│                    ARTICLE SYNTHESIS PIPELINE                       │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  STAGE 1: CANDIDATES                                               │
-│  ┌─────────────────────────────────────────────────────────────┐  │
-│  │  Generate N article candidates (parallel or sequential)    │  │
-│  │  Each candidate is a complete marketing blog post           │  │
-│  └─────────────────────────────────────────────────────────────┘  │
-│                              ↓                                    │
-│  STAGE 2: EXTRACT                                                 │
-│  ┌─────────────────────────────────────────────────────────────┐  │
-│  │  Convert full articles into structured ArticleCards         │  │
-│  │  Extract: headlines, hook, argument, structure, etc.       │  │
-│  └─────────────────────────────────────────────────────────────┘  │
-│                              ↓                                    │
-│  STAGE 3: SCORE                                                   │
-│  ┌─────────────────────────────────────────────────────────────┐  │
-│  │  Evaluate each card on 7 quality dimensions                │  │
-│  │  - hook_strength (15%)  - argument_clarity (20%)           │  │
-│  │  - evidence_quality (15%) - structural_coherence (15%)    │  │
-│  │  - originality (15%)     - memorability (10%)              │  │
-│  │  - actionability (10%)                                   │  │
-│  │  Multiple votes per card for consistency                   │  │
-│  └─────────────────────────────────────────────────────────────┘  │
-│                              ↓                                    │
-│  STAGE 4: SELECT                                                  │
-│  ┌─────────────────────────────────────────────────────────────┐  │
-│  │  Analyze all cards and scores to create SynthesisBlueprint │  │
-│  │  Select best elements from each candidate for synthesis   │  │
-│  └─────────────────────────────────────────────────────────────┘  │
-│                              ↓                                    │
-│  STAGE 5: SYNTHESIZE                                              │
-│  ┌─────────────────────────────────────────────────────────────┐  │
-│  │  Generate final article from blueprint                     │  │
-│  │  Combine selected elements into one coherent piece        │  │
-│  └─────────────────────────────────────────────────────────────┘  │
-│                              ↓                                    │
-│  STAGE 6: VALIDATE                                                │
-│  ┌─────────────────────────────────────────────────────────────┐  │
-│  │  Verify article meets quality standards                    │  │
-│  │  Check blueprint compliance, quality score, coherence     │  │
-│  │  Retry synthesis if validation fails                       │  │
-│  └─────────────────────────────────────────────────────────────┘  │
+│  STAGE 1: CANDIDATES  (--candidate-presets)                        │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Generate N article candidates using multiple models        │   │
+│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐                       │   │
+│  │  │ Model A │ │ Model B │ │ Model C │  (parallel/sequential)│   │
+│  │  │ 2 arts  │ │ 2 arts  │ │ 2 arts  │                       │   │
+│  │  └─────────┘ └─────────┘ └─────────┘                       │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              ↓                                      │
+│  ════════════════════════════════════════════════════════════════  │
+│                    (--pipeline-preset applies below)                │
+│  ════════════════════════════════════════════════════════════════  │
+│                              ↓                                      │
+│  STAGE 2: EXTRACT                                                   │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Convert full articles into structured ArticleCards         │   │
+│  │  Extract: headlines, hook, argument, structure, etc.        │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              ↓                                      │
+│  STAGE 3: SCORE                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Evaluate each card on 7 quality dimensions                 │   │
+│  │  - hook_strength (15%)  - argument_clarity (20%)            │   │
+│  │  - evidence_quality (15%) - structural_coherence (15%)      │   │
+│  │  - originality (15%)     - memorability (10%)               │   │
+│  │  - actionability (10%)                                      │   │
+│  │  Multiple votes per card for consistency                    │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              ↓                                      │
+│  STAGE 4: SELECT                                                    │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Analyze all cards and scores to create SynthesisBlueprint  │   │
+│  │  Select best elements from each candidate for synthesis     │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              ↓                                      │
+│  STAGE 5: SYNTHESIZE                                                │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Generate final article from blueprint                      │   │
+│  │  Combine selected elements into one coherent piece          │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              ↓                                      │
+│  STAGE 6: VALIDATE                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Verify article meets quality standards                     │   │
+│  │  Check blueprint compliance, quality score, coherence       │   │
+│  │  Retry synthesis if validation fails                        │   │
+│  └─────────────────────────────────────────────────────────────┘   │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+**Model Separation Benefits:**
+- Use creative/diverse models for candidate generation to get varied perspectives
+- Use a consistent, reliable model for analysis and synthesis stages
+- Reduce costs by using cheaper models where appropriate
 
 ## Scoring Modes
 
