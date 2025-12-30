@@ -2453,7 +2453,7 @@ def save_candidate_file(
         print(f"  Candidate {candidate.article_id} saved: {filename}")
 
 
-def generate_candidates_parallel(
+def generate_candidates(
     preset_iterations: List[Tuple[str, int]],
     generation_system_prompt: str,
     generation_user_prompt: str,
@@ -2463,14 +2463,16 @@ def generate_candidates_parallel(
     retry_delay: float,
     filter_think: bool,
     output_base: Optional[str],
+    parallel: bool = False,
     max_concurrent: int = 5,
     verbose: bool = False
 ) -> List[ArticleCandidate]:
     """
-    Generate multiple article candidates in parallel using ThreadPoolExecutor.
+    Generate multiple article candidates using either parallel or sequential execution.
 
     Distributes generation across multiple presets, with each preset generating
-    a specified number of candidates.
+    a specified number of candidates. Both parallel and sequential modes use the
+    same core generation logic via generate_single_candidate().
 
     Args:
         preset_iterations: List of (preset_name, iterations_count) tuples
@@ -2482,7 +2484,8 @@ def generate_candidates_parallel(
         retry_delay: Delay between retries
         filter_think: Whether to filter think tags
         output_base: Base filename for outputs (optional)
-        max_concurrent: Maximum concurrent LLM requests
+        parallel: Use parallel generation with ThreadPoolExecutor
+        max_concurrent: Maximum concurrent LLM requests (only used when parallel=True)
         verbose: Enable verbose logging
 
     Returns:
@@ -2491,11 +2494,15 @@ def generate_candidates_parallel(
     # Calculate total iterations
     total_iterations = sum(count for _, count in preset_iterations)
 
+    mode_name = "PARALLEL" if parallel else "SEQUENTIAL"
     if verbose:
         print(f"\n{'='*80}")
-        print(f"PARALLEL CANDIDATE GENERATION (Multi-Preset)")
+        print(f"{mode_name} CANDIDATE GENERATION (Multi-Preset)")
         print(f"{'='*80}")
-        print(f"Generating {total_iterations} candidates with max {max_concurrent} concurrent requests...")
+        if parallel:
+            print(f"Generating {total_iterations} candidates with max {max_concurrent} concurrent requests...")
+        else:
+            print(f"Generating {total_iterations} candidates sequentially...")
         for preset_name, count in preset_iterations:
             print(f"  - {preset_name}: {count} candidates")
 
@@ -2514,37 +2521,78 @@ def generate_candidates_parallel(
             tasks.append((article_id, preset_name))
             article_id += 1
 
-    # Use ThreadPoolExecutor for parallel generation
-    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
-        # Submit all generation tasks
-        future_to_task = {
-            executor.submit(
-                generate_single_candidate,
-                task_article_id,
-                task_preset_name,
-                generation_system_prompt,
-                generation_user_prompt,
-                temperature,
-                max_tokens,
-                retry_count,
-                retry_delay,
-                filter_think,
-                verbose
-            ): (task_article_id, task_preset_name)
-            for task_article_id, task_preset_name in tasks
-        }
+    if parallel:
+        # Parallel generation using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+            # Submit all generation tasks
+            future_to_task = {
+                executor.submit(
+                    generate_single_candidate,
+                    task_article_id,
+                    task_preset_name,
+                    generation_system_prompt,
+                    generation_user_prompt,
+                    temperature,
+                    max_tokens,
+                    retry_count,
+                    retry_delay,
+                    filter_think,
+                    verbose
+                ): (task_article_id, task_preset_name)
+                for task_article_id, task_preset_name in tasks
+            }
 
-        # Collect results as they complete
-        completed = 0
-        for future in as_completed(future_to_task):
-            task_article_id, task_preset_name = future_to_task[future]
+            # Collect results as they complete
+            completed = 0
+            for future in as_completed(future_to_task):
+                task_article_id, task_preset_name = future_to_task[future]
+                try:
+                    candidate = future.result()
+                    candidates.append(candidate)
+                    completed += 1
+
+                    if verbose:
+                        print(f"Progress: {completed}/{total_iterations} candidates complete")
+
+                    # Save candidate file if output is specified
+                    if output_base and output_dir:
+                        save_candidate_file(
+                            candidate,
+                            output_dir,
+                            output_base,
+                            total_iterations,
+                            verbose=False  # Reduce verbosity in parallel mode
+                        )
+
+                except Exception as e:
+                    if verbose:
+                        print(f"  ✗ Candidate {task_article_id} ({task_preset_name}) failed: {e}")
+
+        # Sort candidates by article_id to maintain order
+        candidates.sort(key=lambda c: c.article_id)
+    else:
+        # Sequential generation
+        for task_article_id, task_preset_name in tasks:
+            if verbose:
+                print(f"Generating candidate {task_article_id}/{total_iterations} using {task_preset_name}...")
+
             try:
-                candidate = future.result()
+                candidate = generate_single_candidate(
+                    article_id=task_article_id,
+                    preset_name=task_preset_name,
+                    generation_system_prompt=generation_system_prompt,
+                    generation_user_prompt=generation_user_prompt,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    retry_count=retry_count,
+                    retry_delay=retry_delay,
+                    filter_think=filter_think,
+                    verbose=verbose
+                )
                 candidates.append(candidate)
-                completed += 1
 
                 if verbose:
-                    print(f"Progress: {completed}/{total_iterations} candidates complete")
+                    print(f"Progress: {task_article_id}/{total_iterations} candidates complete")
 
                 # Save candidate file if output is specified
                 if output_base and output_dir:
@@ -2553,18 +2601,15 @@ def generate_candidates_parallel(
                         output_dir,
                         output_base,
                         total_iterations,
-                        verbose=False  # Reduce verbosity in parallel mode
+                        verbose=verbose
                     )
 
             except Exception as e:
                 if verbose:
                     print(f"  ✗ Candidate {task_article_id} ({task_preset_name}) failed: {e}")
 
-    # Sort candidates by article_id to maintain order
-    candidates.sort(key=lambda c: c.article_id)
-
     if verbose:
-        print(f"✓ Parallel generation complete: {len(candidates)}/{total_iterations} candidates generated\n")
+        print(f"✓ {mode_name.capitalize()} generation complete: {len(candidates)}/{total_iterations} candidates generated\n")
 
     return candidates
 
@@ -2896,85 +2941,22 @@ When writing marketing content, always:
             candidates = load_candidate_files(args.candidates_dir, verbose=args.verbose)
         else:
             # Mode 1 or 3: Generate candidates (default or --candidates-only)
-            # Choose parallel or sequential generation
-            if args.parallel:
-                # Parallel generation using ThreadPoolExecutor with multi-preset support
-                candidates = generate_candidates_parallel(
-                    preset_iterations=preset_iterations,
-                    generation_system_prompt=generation_system_prompt,
-                    generation_user_prompt=generation_user_prompt,
-                    temperature=args.temperature,
-                    max_tokens=args.max_tokens,
-                    retry_count=args.retry_count,
-                    retry_delay=args.retry_delay,
-                    filter_think=args.filter_think,
-                    output_base=args.output,
-                    max_concurrent=args.max_concurrent,
-                    verbose=args.verbose
-                )
-            else:
-                # Sequential generation with multi-preset support
-                candidates = []
-                article_id = 1
+            # Unified generation function handles both parallel and sequential modes
+            candidates = generate_candidates(
+                preset_iterations=preset_iterations,
+                generation_system_prompt=generation_system_prompt,
+                generation_user_prompt=generation_user_prompt,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
+                retry_count=args.retry_count,
+                retry_delay=args.retry_delay,
+                filter_think=args.filter_think,
+                output_base=args.output,
+                parallel=args.parallel,
+                max_concurrent=args.max_concurrent,
+                verbose=args.verbose
+            )
 
-                for preset_name, preset_iter_count in preset_iterations:
-                    if args.verbose:
-                        print(f"\n--- Generating with preset: {preset_name} ---")
-
-                    for i in range(preset_iter_count):
-                        if args.verbose:
-                            print(f"Generating candidate {article_id}/{actual_total_candidates} using {preset_name}...")
-
-                        # Prepare input text for metrics tracking
-                        input_text = generation_system_prompt + "\n\n" + generation_user_prompt
-
-                        # Send to LLM with timing using preset-specific configuration
-                        llm_start_time = time.time()
-                        response = send_to_llm_with_preset(
-                            preset_name=preset_name,
-                            llm_user_prompt=generation_user_prompt,
-                            llm_system_prompt=generation_system_prompt,
-                            temperature=args.temperature,
-                            max_tokens=args.max_tokens,
-                            retry_count=args.retry_count,
-                            retry_delay=args.retry_delay,
-                            verbose=args.verbose
-                        )
-                        llm_end_time = time.time()
-                        execution_time = llm_end_time - llm_start_time
-
-                        # Apply think tag filtering if requested
-                        if args.filter_think:
-                            if args.verbose:
-                                print("Filtering out content between <think> tags...")
-                            response = filter_think_tags(response)
-
-                        # Track LLM call metrics
-                        track_llm_call("CANDIDATES", input_text, response, execution_time)
-
-                        # Store candidate in memory
-                        candidate = ArticleCandidate(
-                            article_id=article_id,
-                            content=response,
-                            word_count=len(response.split()),
-                            generation_timestamp=time.time(),
-                            preset_name=preset_name
-                        )
-                        candidates.append(candidate)
-
-                        # Save individual candidate files to organized structure
-                        if args.output:
-                            output_dir = create_output_directory(args.output)
-                            save_candidate_file(
-                                candidate,
-                                output_dir,
-                                args.output,
-                                actual_total_candidates,
-                                verbose=args.verbose
-                            )
-
-                        article_id += 1
-            
             # Add total execution time for candidates stage (only if we actually generated)
             stage_end_time = time.time()
             pipeline_metrics.candidates_stage.add_execution_time(stage_end_time - stage_start_time)
