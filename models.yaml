@@ -1,0 +1,89 @@
+# LLM Provider and Model Configuration
+# API keys are stored in .env file and referenced via api_key_env
+
+providers:
+  local:
+    base_url: "http://192.168.8.90:42069/v1"
+    api_key_env: "LOCAL_API_KEY"
+    models:
+      - minimax-m2.1
+      - gpt-oss-120b
+      - glm-45-air
+      - qwen3-vl-30b-inst
+      - qwen3-think-30b-awq8
+
+  openai:
+    base_url: "https://api.openai.com/v1"
+    api_key_env: "OPENAI_API_KEY"
+    models:
+      - gpt-4o
+      - gpt-4o-mini
+      - gpt-4-turbo
+
+  anthropic-openai:
+    # Anthropic via OpenAI-compatible proxy (if using one)
+    base_url: "https://api.anthropic.com/v1"
+    api_key_env: "ANTHROPIC_API_KEY"
+    models:
+      - claude-3-5-sonnet-20241022
+      - claude-3-5-haiku-20241022
+
+  openrouter:
+    # Anthropic via OpenAI-compatible proxy (if using one)
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: "OPENROUTER_API_KEY"
+    models:
+      - anthropic/claude-sonnet-4.5
+      - anthropic/claude-haiku-4.5
+      - moonshotai/kimi-k2-0905
+
+
+# Presets: quick shortcuts for provider + model combinations
+presets:
+  local-minimax:
+    provider: local
+    model: minimax-m2.1
+    description: "Local vLLM server with MiniMax M2.1"
+
+  local-qwen:
+    provider: local
+    model: qwen3-vl-30b-inst
+    description: "Local vLLM server with Qwen3 VL 30B"
+
+  local-qwen-think:
+    provider: local
+    model: qwen3-think-30b-awq8
+    description: "Local vLLM server with Qwen3 Think 30B (reasoning model)"
+
+  local-glm:
+    provider: local
+    model: glm-45-air
+    description: "Local vLLM server with GLM-4.5 Air"
+
+  local-gpt-oss:
+    provider: local
+    model: gpt-oss-120b
+    description: "Local vLLM server with GPT-OSS 120B"
+
+  openai-4o:
+    provider: openai
+    model: gpt-4o
+    description: "OpenAI GPT-4o"
+
+  openai-4o-mini:
+    provider: openai
+    model: gpt-4o-mini
+    description: "OpenAI GPT-4o Mini (faster, cheaper)"
+
+  or-sonnet-45:
+    provider: openrouter
+    model: anthropic/claude-sonnet-4.5
+    description: "OpenRouter claude-sonnet-4.5"
+
+  or-kimik2-0905:
+    provider: openrouter
+    model: moonshotai/kimi-k2-0905
+    description: "OpenRouter Kimi K2 0905"
+
+# Default preset used when no --preset flag is provided
+default_preset: local-minimax

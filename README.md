@@ -14,33 +14,120 @@ A sophisticated marketing blog post generation tool that uses a local OpenAI-com
 ## Installation
 
 ```bash
-# Install dependencies
-pip install python-dotenv openai
+# Install dependencies using pipenv
+pipenv install
+
+# Or with pip
+pip install python-dotenv openai pyyaml
 
 # Set up environment variables
-cp .env.example .env  # Create your .env file
+cp .env.example .env  # Create your .env file with API keys
 ```
 
-## Environment Variables
+## Configuration
 
-Create a `.env` file with the following variables:
+### Model Configuration (`models.yaml`)
+
+The tool uses a YAML configuration file to manage LLM providers and models. This allows easy switching between different models without editing environment variables.
+
+**Example `models.yaml`:**
+
+```yaml
+providers:
+  local:
+    base_url: "http://192.168.8.90:42069/v1"
+    api_key_env: "LOCAL_API_KEY"  # References .env variable
+    models:
+      - minimax-m2.1
+      - qwen3-vl-30b-inst
+      - glm-45-air
+
+  openai:
+    base_url: "https://api.openai.com/v1"
+    api_key_env: "OPENAI_API_KEY"
+    models:
+      - gpt-4o
+      - gpt-4o-mini
+
+presets:
+  local-minimax:
+    provider: local
+    model: minimax-m2.1
+    description: "Local vLLM server with MiniMax M2.1"
+
+  openai-4o:
+    provider: openai
+    model: gpt-4o
+    description: "OpenAI GPT-4o"
+
+default_preset: local-minimax  # Used when no --preset flag specified
+```
+
+### Environment Variables (`.env`)
+
+Create a `.env` file with **API keys only** (secrets that shouldn't be in version control):
 
 ```env
-OPENAI_API_BASE=http://localhost:8000/v1  # Your local OpenAI-compliant API endpoint
-OPENAI_API_KEY=sk-dummy-key-if-not-needed  # API key (or dummy if not required)
-OPENAI_MODEL_NAME=your-model-name           # Model name to use
+# API Keys for LLM Providers
+LOCAL_API_KEY=outsider
+OPENAI_API_KEY=sk-your-key-here
+ANTHROPIC_API_KEY=sk-ant-your-key-here
+```
+
+**Note:** Provider endpoints and model names are now configured in `models.yaml`, not `.env`.
+
+### Managing Models
+
+**Adding a new provider:**
+
+1. Edit `models.yaml` and add a new provider entry:
+```yaml
+providers:
+  anthropic:
+    base_url: "https://api.anthropic.com/v1"
+    api_key_env: "ANTHROPIC_API_KEY"
+    models:
+      - claude-3-5-sonnet-20241022
+```
+
+2. Add the corresponding API key to `.env`:
+```env
+ANTHROPIC_API_KEY=sk-ant-your-key-here
+```
+
+**Adding a new preset:**
+
+```yaml
+presets:
+  anthropic-sonnet:
+    provider: anthropic
+    model: claude-3-5-sonnet-20241022
+    description: "Anthropic Claude 3.5 Sonnet"
+```
+
+**Changing the default model:**
+
+```yaml
+default_preset: local-qwen  # Change this to any preset name
 ```
 
 ## Command Line Flags
+
+### Model Selection Options
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--preset` | string | - | Model preset to use (e.g., 'local-minimax', 'local-qwen'). Overrides the default preset from `models.yaml`. |
+| `--list-models` | flag | False | List all available model presets and exit. Shows providers, models, and descriptions. |
 
 ### Generation Options
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--temperature` | float | 0.7 | Sampling temperature for LLM generation. Higher values (0.8) produce more creative output, lower values (0.3) produce more focused content. |
-| `--max-token` | int | 4000 | Maximum number of tokens to generate per LLM call. |
+| `--max-tokens` | int | 4000 | Maximum number of tokens to generate per LLM call. |
 | `--output` | string | - | Base filename (without extension) to save LLM responses. Creates numbered markdown files when using multiple iterations. |
-| `--iteration` | int | 1 | Number of times to run the LLM generation routine. Creates numbered output files when > 1. |
+| `--iterations` | int | 1 | Number of times to run the LLM generation routine. Creates numbered output files when > 1. |
 | `--verbose` | flag | False | Enable verbose output for detailed progress tracking. |
 | `--retry-count` | int | 3 | Number of API call retries on failure. |
 | `--retry-delay` | float | 1.0 | Delay between retry attempts in seconds. |
@@ -73,23 +160,43 @@ OPENAI_MODEL_NAME=your-model-name           # Model name to use
 
 ## Usage Examples
 
+### List Available Models
+
+View all configured model presets:
+
+```bash
+python post_generator.py --list-models
+```
+
 ### Basic Single Article Generation
 
-Generate a single marketing blog post:
+Generate a single marketing blog post using the default preset:
 
 ```bash
 python post_generator.py --topic-file prompts/construkted_globe.txt --output my_article
 ```
 
-### Multiple Candidate Generation
+### Generate with a Specific Model
 
-Generate 5 candidate articles in parallel:
+Use a different model preset:
 
 ```bash
 python post_generator.py \
+  --preset local-qwen \
+  --topic-file prompts/construkted_globe.txt \
+  --output my_article
+```
+
+### Multiple Candidate Generation
+
+Generate 5 candidate articles in parallel using a specific model:
+
+```bash
+python post_generator.py \
+  --preset local-minimax \
   --topic-file prompts/construkted_globe.txt \
   --output blog_candidates \
-  --iteration 5 \
+  --iterations 5 \
   --parallel \
   --max-concurrent 5
 ```
@@ -100,9 +207,10 @@ Generate candidates without running synthesis (useful for reviewing before selec
 
 ```bash
 python post_generator.py \
+  --preset local-qwen-think \
   --topic-file prompts/construkted_globe.txt \
   --output review_candidates \
-  --iteration 3 \
+  --iterations 3 \
   --candidates-only \
   --verbose
 ```

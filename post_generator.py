@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import yaml
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -230,23 +232,142 @@ SCORING_CRITERIA = {
     }
 }
 
-def load_environment() -> None:
-    """Load .env file and set environment variables."""
+# ============================================================================
+# MODEL CONFIGURATION SYSTEM
+# ============================================================================
+
+def load_models_config(config_path: str = "models.yaml") -> Dict[str, Any]:
+    """Load the models configuration from YAML file.
+
+    Args:
+        config_path: Path to the models.yaml configuration file
+
+    Returns:
+        Dictionary containing providers, presets, and default_preset
+    """
+    path = Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Models configuration file not found: {config_path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    return config
+
+
+def list_available_presets(config_path: str = "models.yaml") -> None:
+    """Print all available presets from the configuration file."""
+    try:
+        config = load_models_config(config_path)
+    except FileNotFoundError:
+        print(f"Error: Configuration file '{config_path}' not found.")
+        return
+
+    presets = config.get("presets", {})
+    default_preset = config.get("default_preset", "")
+
+    print("\n" + "=" * 60)
+    print("AVAILABLE MODEL PRESETS")
+    print("=" * 60)
+
+    for preset_name, preset_config in presets.items():
+        provider = preset_config.get("provider", "unknown")
+        model = preset_config.get("model", "unknown")
+        description = preset_config.get("description", "")
+        is_default = " (default)" if preset_name == default_preset else ""
+
+        print(f"\n  {preset_name}{is_default}")
+        print(f"    Provider: {provider}")
+        print(f"    Model:    {model}")
+        if description:
+            print(f"    Description: {description}")
+
+    print("\n" + "=" * 60)
+    print(f"Usage: python post_generator.py --preset <preset_name> ...")
+    print("=" * 60 + "\n")
+
+
+def get_preset_config(preset_name: str, config_path: str = "models.yaml") -> Tuple[str, str, str]:
+    """Get the configuration for a specific preset.
+
+    Args:
+        preset_name: Name of the preset to load
+        config_path: Path to the models.yaml configuration file
+
+    Returns:
+        Tuple of (base_url, api_key, model_name)
+    """
+    config = load_models_config(config_path)
+
+    presets = config.get("presets", {})
+    providers = config.get("providers", {})
+
+    if preset_name not in presets:
+        available = ", ".join(presets.keys())
+        raise ValueError(f"Preset '{preset_name}' not found. Available presets: {available}")
+
+    preset = presets[preset_name]
+    provider_name = preset.get("provider")
+    model_name = preset.get("model")
+
+    if provider_name not in providers:
+        raise ValueError(f"Provider '{provider_name}' referenced by preset '{preset_name}' not found in configuration.")
+
+    provider = providers[provider_name]
+    base_url = provider.get("base_url")
+    api_key_env = provider.get("api_key_env", "")
+
+    # Get API key from environment variable
+    api_key = os.getenv(api_key_env, "sk-dummy-key-if-not-needed")
+
+    return base_url, api_key, model_name
+
+
+def load_environment(preset: Optional[str] = None, config_path: str = "models.yaml") -> None:
+    """Load environment configuration, optionally using a preset.
+
+    Args:
+        preset: Name of the preset to use. If None, falls back to .env file or default preset.
+        config_path: Path to the models.yaml configuration file
+    """
+    # Always load .env first for API keys
     load_dotenv()
-    
-    # Validate required OpenAI configuration
+
+    # Determine which preset to use
+    if preset:
+        # Explicit preset specified via command line
+        base_url, api_key, model_name = get_preset_config(preset, config_path)
+        os.environ["OPENAI_API_BASE"] = base_url
+        os.environ["OPENAI_API_KEY"] = api_key
+        os.environ["OPENAI_MODEL_NAME"] = model_name
+        return
+
+    # Check if models.yaml exists and has a default preset
+    config_file = Path(config_path)
+    if config_file.exists():
+        try:
+            config = load_models_config(config_path)
+            default_preset = config.get("default_preset")
+            if default_preset:
+                base_url, api_key, model_name = get_preset_config(default_preset, config_path)
+                os.environ["OPENAI_API_BASE"] = base_url
+                os.environ["OPENAI_API_KEY"] = api_key
+                os.environ["OPENAI_MODEL_NAME"] = model_name
+                return
+        except Exception:
+            pass  # Fall through to .env-based configuration
+
+    # Fallback to original .env-based configuration
     openai_api_base = os.getenv("OPENAI_API_BASE")
     if not openai_api_base:
-        raise ValueError("OPENAI_API_BASE environment variable is not set.")
+        raise ValueError("OPENAI_API_BASE environment variable is not set and no preset configured.")
     os.environ["OPENAI_API_BASE"] = openai_api_base
-    
-    # Set API key (use dummy key if server doesn't require authentication)
+
     os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY", "sk-dummy-key-if-not-needed")
-    
-    # Validate model name
+
     openai_model_name = os.getenv("OPENAI_MODEL_NAME")
     if not openai_model_name:
-        raise ValueError("OPENAI_MODEL_NAME environment variable is not set.")
+        raise ValueError("OPENAI_MODEL_NAME environment variable is not set and no preset configured.")
     os.environ["OPENAI_MODEL_NAME"] = openai_model_name
 
 
@@ -2413,7 +2534,18 @@ def main():
     parser = argparse.ArgumentParser(
         description="Generate marketing blog posts with optional synthesis pipeline. Can run multiple iterations with numbered output files."
     )
-    
+
+    # Model selection arguments
+    parser.add_argument(
+        "--preset",
+        help="Model preset to use (e.g., 'local-minimax', 'local-qwen'). See --list-models for available presets."
+    )
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help="List all available model presets and exit"
+    )
+
     # Existing generation arguments
     parser.add_argument(
         "--temperature",
@@ -2519,20 +2651,28 @@ def main():
     )
 
     args = parser.parse_args()
-    
+
+    # Handle --list-models flag
+    if args.list_models:
+        list_available_presets()
+        return 0
+
     # Handle cleanup if requested
     if args.cleanup_old > 0:
         if args.verbose:
             print(f"Cleaning up output directories older than {args.cleanup_old} days...")
         cleanup_old_outputs(args.cleanup_old)
         return 0
-    
+
     try:
-        # Load environment variables
+        # Load environment variables with optional preset
         if args.verbose:
-            print("Loading environment variables...")
-        load_environment()
-        
+            if args.preset:
+                print(f"Loading preset: {args.preset}")
+            else:
+                print("Loading default model configuration...")
+        load_environment(preset=args.preset)
+
         if args.verbose:
             print(f"API Base URL: {os.getenv('OPENAI_API_BASE')}")
             print(f"Model Name: {os.getenv('OPENAI_MODEL_NAME')}")
