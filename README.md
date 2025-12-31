@@ -18,8 +18,9 @@ python post_generator.py --topic-file prompts/my_topic.txt --output my_article
 ## What It Does
 
 Generates high-quality marketing blog posts through a 6-stage pipeline:
-
+### Multiple article generation
 1. **CANDIDATES** - Generate multiple article drafts (in parallel if desired)
+### Synthesis stages
 2. **EXTRACT** - Convert articles into structured data cards
 3. **SCORE** - Evaluate quality across 7 dimensions
 4. **SELECT** - Pick the best elements from each candidate
